@@ -740,6 +740,36 @@ ARMS["history_kv_full_r100_persistent"] = Arm(
     ),
 )
 
+# GP-SJCS dynamic Tool/History scheduling. These registry entries provide a
+# validated persistent physical-KV envelope; the proxy replaces the per-turn
+# Tool/History retention specification with the scheduler's selected A0-A4
+# configuration before the request is assembled. Tool Definition C2KV gist
+# extraction is intentionally not claimed by these arms: the current history
+# checkpoint was not trained for joint Tool+History gist compression.
+for _name in (
+    "fixed20k_joint", "gp_length_only", "gp_sjcs",
+    "gp_profile_a0", "gp_profile_a1", "gp_profile_a2",
+    "gp_profile_a3", "gp_profile_a4",
+):
+    ARMS[_name] = Arm(
+        name=_name,
+        compress_history=False,
+        history_kv={
+            "method": "snapkv_persistent",
+            "retention_ratio": 1.0,
+            "tool_retention_ratio": 1.0,
+            "backend": "physical_eviction",
+            "persistent_session": True,
+            "compress_tools": True,
+            "compress_completed_history": True,
+        },
+        query_projection="base",
+        description=(
+            "Dynamic GP-SJCS envelope over persistent native Tool/History KV; "
+            "the proxy selects A0-A4 per request and logs actual resident KV"
+        ),
+    )
+
 # Cross-backend public names: the non-Racer names are persistent 25% controls.
 for _public, _method in ((
     "streamingllm_r25", "streamingllm"), (

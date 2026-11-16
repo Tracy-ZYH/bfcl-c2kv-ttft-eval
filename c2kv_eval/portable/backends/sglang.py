@@ -372,10 +372,27 @@ class SglangBackend(Backend):
         compress_history = bool(spec.get("compress_completed_history", True))
         if ((not indices or not history.get("history_text"))
                 and not compress_tools):
-            # first turn of a conversation: nothing completed to compress.
-            # Upstream returns the current block unchanged and issues no
-            # extract; no hint is sent, so such a row simply carries no
-            # history_kv_* cost columns.
+            # There is nothing to compress on the first turn. A persistent
+            # physical arm must nevertheless establish its canonical prompt
+            # and resident session now; otherwise turn two reuses the low-level
+            # SGLang session without a matching canonical delta and appends a
+            # second copy of the full prompt. Keep this request a compression
+            # no-op by deliberately omitting history_kv_eviction.
+            if str(spec["backend"]) == "physical_eviction" and session_id:
+                return list(messages), {
+                    "full_equivalent_history_tokens": 0,
+                    "active_history_kv_tokens": 0,
+                    "active_full_raw_tokens": 0,
+                    "active_c2kv_gist_tokens": 0,
+                    "history_kv_method": method,
+                    "estimated": True,
+                    "history_kv_backend": "physical_eviction",
+                    "requested_history_budget": spec.get("target_tokens"),
+                    "persistent_history_session": {
+                        "enabled": True,
+                        "session_id": session_id,
+                    },
+                }, session_id
             return list(messages), None, session_id
 
         if str(spec["backend"]) == "physical_eviction":
@@ -392,11 +409,21 @@ class SglangBackend(Backend):
             }
             if history.get("joint_scope_mode"):
                 eviction.update({
+                    "joint_scope_mode": True,
                     "compress_tools": compress_tools,
                     "compress_completed_history": compress_history,
                     "tool_retention_ratio": float(spec["tool_retention_ratio"]),
                 })
-            if compress_history and indices:
+                # Always send completed-history boundaries for joint-scope
+                # accounting. A disabled scope is retained at 100%, not
+                # omitted from the overall Tool+History denominator.
+                if indices:
+                    eviction.update({
+                        "history_start_message_count": int(
+                            history.get("history_start_message_count") or 0),
+                        "history_message_count": count,
+                    })
+            elif compress_history and indices:
                 eviction.update({
                     "history_start_message_count": int(
                         history.get("history_start_message_count") or 0),
@@ -924,6 +951,20 @@ class SglangBackend(Backend):
             if k in runtime}
         if isinstance(metadata, dict) and metadata.get("finish_message") is not None:
             cost["finish_message"] = metadata["finish_message"]
+        speed_timing = metadata.get("speed_timing") if isinstance(metadata, dict) else None
+        if isinstance(speed_timing, dict):
+            for key in (
+                "schema", "clock", "first_token_source", "server_ttft_ms",
+                "prefill_path_ms", "scope",
+            ):
+                if speed_timing.get(key) is not None:
+                    cost[f"speed_{key}"] = speed_timing[key]
+            # Stable headlines for portable summaries. Unlike wall_sec,
+            # server_ttft_ms ends at the first sampled output token.
+            if speed_timing.get("server_ttft_ms") is not None:
+                cost["server_ttft_ms"] = speed_timing["server_ttft_ms"]
+            if speed_timing.get("prefill_path_ms") is not None:
+                cost["prefill_path_ms"] = speed_timing["prefill_path_ms"]
         parity = metadata.get("parity_debug") if isinstance(metadata, dict) else None
         if isinstance(parity, dict):
             cost["parity_debug"] = parity

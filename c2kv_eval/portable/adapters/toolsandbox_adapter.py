@@ -72,7 +72,7 @@ def split_scenarios(raw) -> "list[str] | None":
     return [s for s in items if s] or None
 
 
-def harness_env(base_url: str, user_base_url: str = "") -> Dict[str, str]:
+def harness_env(base_url: str, user_base_url: str = "", agent_model: str = "", user_model: str = "") -> Dict[str, str]:
     """``user_base_url`` (default: the raw upstream endpoint) routes the
     user simulator OUT of the arm proxy via TOOLSANDBOX_USER_BASE_URL —
     the patched openai_api_user role reads it.  Routing the simulator
@@ -82,6 +82,8 @@ def harness_env(base_url: str, user_base_url: str = "") -> Dict[str, str]:
         **os.environ,
         "OPENAI_API_KEY": "EMPTY",
         "OPENAI_API_KEY_USER": "EMPTY",
+        "TOOLSANDBOX_AGENT_MODEL": agent_model,
+        "TOOLSANDBOX_USER_MODEL": user_model,
         "OPENAI_BASE_URL": v1(base_url),
         # default: same endpoint the proxy itself fronts (full mode)
         "TOOLSANDBOX_USER_BASE_URL": v1(user_base_url) if user_base_url
@@ -103,6 +105,7 @@ def run(ctx: RunContext) -> Dict[str, Any]:
         # the user simulator must NOT ride the arm proxy: route it to the
         # raw upstream endpoint (tau2 already does the same split)
         user_base_url=ctx.user_base_url,
+        agent_model=ctx.model, user_model=str(ctx.opt("checkpoint", ctx.model)),
         scenarios=scenarios,
         # An explicit -s selection has a fixed denominator.  Do not let a
         # missing result row silently turn a finite smoke into a smaller run.
@@ -128,7 +131,8 @@ def run_ts(base_url: str, out_dir: Path, test_mode: bool = True,
             benchmark_dir: Path = None, user_base_url: str = "",
             scenarios: "list[str] | None" = None,
             expected_task_ids: "list[str] | None" = None,
-            python: "str | None" = None) -> Dict[str, Any]:
+            python: "str | None" = None, agent_model: str = "",
+            user_model: str = "") -> Dict[str, Any]:
     """Run the CLI and collect ``result_summary.json``."""
     if expected_task_ids is not None:
         expected_task_ids = [str(task_id) for task_id in expected_task_ids]
@@ -142,7 +146,7 @@ def run_ts(base_url: str, out_dir: Path, test_mode: bool = True,
     ts_dir = (Path(benchmark_dir) if benchmark_dir else TS_DIR).resolve()
     out_dir = Path(out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    env = harness_env(base_url, user_base_url)
+    env = harness_env(base_url, user_base_url, agent_model, user_model)
     # The console script's directory is otherwise first on sys.path, and an
     # editable installation may silently import a different checkout.
     env["PYTHONPATH"] = os.pathsep.join(filter(None, (

@@ -40,6 +40,40 @@ MODEL_NAME = "c2kv-hf"  # BFCL handler key / result-dir name (stable layout)
 SERVED_MODEL = "c2kv-agent"  # default served model name at the endpoint
 
 
+def _normalize_bfcl_execute_result(result: Any) -> List[Dict[str, Dict[str, Any]]]:
+    """Normalize native FC arguments while rejecting non-object payloads.
+
+    BFCL's OpenAI converter accepts either argument dictionaries or JSON
+    strings encoding dictionaries. A model can still emit a valid JSON scalar;
+    the upstream converter then calls .items() on that scalar. BFCL treats
+    that exception as an empty turn, so reject it here without turning a
+    model-format error into a harness error or inventing an argument name.
+    """
+    if isinstance(result, str):
+        return []
+    calls = [result] if isinstance(result, Mapping) else result
+    if not isinstance(calls, (list, tuple)):
+        return []
+
+    normalized: List[Dict[str, Dict[str, Any]]] = []
+    for call in calls:
+        if not isinstance(call, Mapping):
+            return []
+        normalized_call: Dict[str, Dict[str, Any]] = {}
+        for name, raw_arguments in call.items():
+            arguments = raw_arguments
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except (TypeError, ValueError):
+                    return []
+            if not isinstance(arguments, Mapping):
+                return []
+            normalized_call[str(name)] = dict(arguments)
+        normalized.append(normalized_call)
+    return normalized
+
+
 def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
@@ -111,7 +145,8 @@ def install_handler(base_url: str, model: str = SERVED_MODEL,
                     handler_name: "str | None" = None,
                     gold_recovery: "str | None" = None,
                     task_audit_path: "Path | str | None" = None,
-                    bfcl_oracle_max_events: int = 1) -> None:
+                    bfcl_oracle_max_events: int = 1,
+                    request_timeout: float = 600.0) -> None:
     # NOTE: default resolved at CALL time — binding the default to
     # MODEL_NAME at def time made monkeypatched names register the
     # wrong key (val20 evaluate failure)
@@ -122,6 +157,9 @@ def install_handler(base_url: str, model: str = SERVED_MODEL,
         raise ValueError("bfcl_oracle_max_events must be a positive integer")
     if bfcl_oracle_max_events > 1 and gold_recovery is None:
         raise ValueError("BFCL multi-event recovery requires a gold-recovery arm")
+    request_timeout = float(request_timeout)
+    if request_timeout <= 0:
+        raise ValueError("request_timeout must be positive")
     import httpx
     from openai import OpenAI
     from bfcl_eval.constants.model_config import MODEL_CONFIG_MAPPING, ModelConfig
@@ -143,8 +181,14 @@ def install_handler(base_url: str, model: str = SERVED_MODEL,
             return {
                 "api_key": "EMPTY",
                 "base_url": base_url,
-                "timeout": httpx.Timeout(timeout=600.0, connect=8.0),
+                "timeout": httpx.Timeout(timeout=request_timeout, connect=8.0),
             }
+
+        def decode_execute(self, result, has_tool_call_tag):
+            normalized = _normalize_bfcl_execute_result(result)
+            if not normalized:
+                return []
+            return super().decode_execute(normalized, has_tool_call_tag)
 
         def inference(self, test_entry: dict, include_input_log: bool,
                       exclude_state_log: bool):
@@ -420,6 +464,7 @@ def run(ctx: RunContext) -> Dict[str, Any]:
             task_audit_path=task_audit_path,
             num_threads=num_threads,
             bfcl_oracle_max_events=oracle_max_events,
+            request_timeout=float(ctx.opt("upstream_timeout", 600)),
         )
     finally:
         os.chdir(prev_cwd)
@@ -446,7 +491,8 @@ def run_bfcl(base_url: str, categories: str = "multi_turn_base",
              gold_recovery: "str | None" = None,
              task_audit_path: "Path | str | None" = None,
              num_threads: int = 1,
-             bfcl_oracle_max_events: int = 1) -> Dict[str, Any]:
+             bfcl_oracle_max_events: int = 1,
+             request_timeout: float = 600.0) -> Dict[str, Any]:
     """Register the handler and drive the official generate/evaluate CLI
     in-process.
 
@@ -489,6 +535,7 @@ def run_bfcl(base_url: str, categories: str = "multi_turn_base",
             gold_recovery=gold_recovery,
             task_audit_path=audit_path,
             bfcl_oracle_max_events=bfcl_oracle_max_events,
+            request_timeout=request_timeout,
         )
         category_counts = official_category_counts(categories)
         ids: Optional[List[str]] = None
@@ -590,6 +637,8 @@ def main(argv=None) -> None:
                         help="BFCL model key / result-dir name")
     parser.add_argument("--num-workers", type=int, default=1,
                         help="BFCL --num-threads value")
+    parser.add_argument("--request-timeout", type=float, default=600.0,
+                        help="BFCL client read timeout in seconds")
     parser.add_argument(
         "--bfcl-oracle-max-events", type=_positive_int, default=1,
         help="gold recovery retries per task; 1 keeps the frozen v2 protocol",
@@ -602,7 +651,8 @@ def main(argv=None) -> None:
                        run_ids=ids, model=args.model,
                        handler_name=args.handler_name,
                        num_threads=args.num_workers,
-                       bfcl_oracle_max_events=args.bfcl_oracle_max_events)
+                       bfcl_oracle_max_events=args.bfcl_oracle_max_events,
+                       request_timeout=args.request_timeout)
     print(json.dumps(summary, indent=2))
 
 

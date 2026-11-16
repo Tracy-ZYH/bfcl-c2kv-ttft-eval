@@ -1,0 +1,37 @@
+
+# BFCL experiment outputs
+bfcl_runs/
+result/
+score/
+logs/
+extra-info/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Runtime
+*.log
+nohup.out
+
+# Models / checkpoints
+models/
+checkpoints/
+
+# IDE
+.vscode/
+.idea/
+.file_locks/
+
+# Local experiment outputs
+results/
+
+# Python package generated metadata
+bfcl_eval.egg-info/
+
+
+/results/
+/runs/
+.env
+.env.*

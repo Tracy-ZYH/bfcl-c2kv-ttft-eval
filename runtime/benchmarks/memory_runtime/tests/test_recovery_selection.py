@@ -628,3 +628,72 @@ def test_risk_precheck_skips_candidate_retrieval_below_threshold(monkeypatch):
     assert result["decision"]["candidate_supply"]["stage"] == (
         "skipped_before_retrieval_by_risk_gate"
     )
+
+
+def test_append_measure_caches_identical_admission_probe_within_round(monkeypatch):
+    from dataclasses import dataclass
+    from memory_runtime.recovery import evidence_units
+
+    monkeypatch.setattr(
+        evidence_units,
+        "render_units",
+        lambda units, *_args, **_kwargs: tuple(unit.text for unit in units),
+    )
+
+    @dataclass(frozen=True)
+    class Policy:
+        whole_event_soft_budget: bool = False
+        history_budget_bytes: int = 4096
+        workspace_budget_bytes: int = 4096
+
+    calls = []
+    measure = SimpleNamespace(
+        reasons=[],
+        per_ratio={"8": {"history_bytes": 128}},
+        memory=SimpleNamespace(),
+    )
+    packer = SimpleNamespace(
+        protected_recovery_messages=(),
+        policy_config=Policy(),
+    )
+
+    def try_measure(*args, **kwargs):
+        calls.append((args, kwargs))
+        return measure
+
+    packer._try_measure = try_measure
+    controller = SimpleNamespace(
+        gp={"P": "verbatim", "order": "source"},
+        _packer=packer,
+    )
+    prepared = SimpleNamespace(
+        _gp_round=0,
+        _gp_base_derived=(),
+        _gp_admission_cache={},
+        _gp_admission_cache_stats={"hits": 0, "misses": 0, "measure_seconds": 0.0},
+        _store=SimpleNamespace(),
+        _tools=[],
+        memory=SimpleNamespace(
+            view=SimpleNamespace(
+                raw_event_ids=(),
+                mandatory_raw_event_ids=(),
+                gist_event_ids=(),
+            )
+        ),
+        metadata={
+            "eligible_extraction": {"eligible_event_ids": ()},
+            "common_raw_prompt_tokens": 0,
+            "max_new_tokens": 16,
+            "requested_ratio": 8,
+        },
+    )
+    evidence = SimpleNamespace(unit_id="u1", event_id="e1", text="evidence")
+
+    first = GPRecoveryController._append_measure(controller, prepared, [evidence])
+    second = GPRecoveryController._append_measure(controller, prepared, [evidence])
+
+    assert len(calls) == 1
+    assert first == second
+    assert first is not second
+    assert prepared._gp_admission_cache_stats["misses"] == 1
+    assert prepared._gp_admission_cache_stats["hits"] == 1

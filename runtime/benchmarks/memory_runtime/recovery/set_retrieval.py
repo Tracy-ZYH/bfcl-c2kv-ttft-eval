@@ -1,6 +1,8 @@
 """Archive retrieval and real, append-only feasibility before selection."""
 from __future__ import annotations
 
+import time
+
 from .evidence_units import build_catalog, unit_is_covered
 from .selection import _catalog_records, _lexical_score, _sort_ranked, _cosine, _validate_embeddings
 from .set_protocol import canonical_text, uncovered_units
@@ -82,8 +84,12 @@ def retrieve_archive(catalog, context, config, models=None):
 def supply_candidates(prepared, tokenizer, config, context, admissible, models=None):
     """Scan past rejected candidates; optionally try fixed fine source windows."""
     store = prepared._store
+    stage_started = time.perf_counter()
     catalog = build_catalog(store, tokenizer, config["U"])
+    catalog_seconds = time.perf_counter() - stage_started
+    stage_started = time.perf_counter()
     ranked, retrieval = retrieve_archive(catalog, context, config, models)
+    retrieval_seconds = time.perf_counter() - stage_started
     eligible = set(prepared.metadata["eligible_extraction"]["eligible_event_ids"])
     cancelled = set(prepared.metadata.get("revision_cancelled_event_ids") or ())
     raw = prepared.memory.raw_source_indices
@@ -93,7 +99,11 @@ def supply_candidates(prepared, tokenizer, config, context, admissible, models=N
         "n_retrieved": len(ranked), "n_after_source_check": 0, "n_feasible": 0,
         "n_presented_to_selector": 0, "n_distinct_sources": 0,
         "retrieval": retrieval, "rejections": [], "fallback_attempts": 0,
-        "feasibility_scan_complete": True}
+        "feasibility_scan_complete": True,
+        "stage_timing": {
+            "build_catalog_seconds": catalog_seconds,
+            "retrieve_archive_seconds": retrieval_seconds,
+        }}
     candidates, seen = [], set()
     draft_names = {(call.get("function") or {}).get("name") for call in context["draft_tool_calls"]}
     draft_names.discard(None)
@@ -121,6 +131,7 @@ def supply_candidates(prepared, tokenizer, config, context, admissible, models=N
             receipt["n_feasible"] += 1
             if len(candidates) >= config["candidate_limit"]:
                 break
+    feasibility_started = time.perf_counter()
     for index, row in enumerate(ranked):
         unit = row["unit"]
         if unit.event_id not in eligible or unit.event_id in cancelled:
@@ -148,6 +159,9 @@ def supply_candidates(prepared, tokenizer, config, context, admissible, models=N
     receipt["n_presented_to_selector"] = len(candidates)
     receipt["n_distinct_sources"] = len({row["event_id"] for row in candidates})
     receipt["presented_ids"] = [row["unit_id"] for row in candidates]
+    receipt["stage_timing"]["supply_feasibility_seconds"] = (
+        time.perf_counter() - feasibility_started
+    )
     return candidates, receipt
 
 

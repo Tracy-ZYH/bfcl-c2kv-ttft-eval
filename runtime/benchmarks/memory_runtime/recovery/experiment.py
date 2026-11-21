@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import math
 import re
+import time
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
@@ -116,6 +117,15 @@ class GPRecoveryController(EventNativeRecoveryController):
             message for message in prepared.metadata.get("derived_workspace_prefix_messages") or ()
             if message not in protected_messages)
         prepared._gp_visible = []
+        # Admission probes are repeated while supplying candidates, building
+        # legal sets, and committing the selected set. They are pure for one
+        # prepared decision/recovery round, so retain the complete result.
+        prepared._gp_admission_cache = {}
+        prepared._gp_admission_cache_stats = {
+            "hits": 0,
+            "misses": 0,
+            "measure_seconds": 0.0,
+        }
         if self.set_protocol:
             prepared._set_draft_logprobs = ()
             prepared.metadata["gp_reservation"] = {
@@ -197,8 +207,12 @@ class GPRecoveryController(EventNativeRecoveryController):
                 raise PolicyInputError("A recovery round cannot inspect two different drafts")
             return _copy_result(prepared._checked_result)
         if not prepared._gp_base_checked:
+            base_started = time.perf_counter()
             self.base.reconsider(prepared._base_prepared, draft_tool_calls,
                                  draft_text=draft_text, parse_error=parse_error)
+            prepared.metadata.setdefault("gp_reconsider_timing", {})[
+                "base_reconsider_seconds"
+            ] = time.perf_counter() - base_started
             prepared._gp_base_checked = True
         prepared._gp_signature = signature
         decision = {
@@ -332,11 +346,16 @@ class GPRecoveryController(EventNativeRecoveryController):
         recovered = self._recovery_counts.get(prepared._store.session_id, 0)
         if prepared.metadata["decision_index"] + recovered + 1 > self.required_task_generation_limit:
             return self._finish_gp(prepared, decision, "shared_task_generation_limit")
+        timings = {}
+        started = time.perf_counter()
         context = context_from_prepared(prepared, draft_tool_calls, draft_text, parse_error)
+        timings["context_from_prepared_seconds"] = time.perf_counter() - started
         if self.gp.get("set_selector") == "risk":
             if self.trained_selector is None:
                 raise ValueError("risk selector artifact was not loaded")
+            started = time.perf_counter()
             prediction = self.trained_selector.predict_risk(context)
+            timings["predict_risk_seconds"] = time.perf_counter() - started
             threshold = float(self.gp.get("selector_threshold", 0.5))
             score = prediction.score
             triggered = bool(
@@ -405,15 +424,20 @@ class GPRecoveryController(EventNativeRecoveryController):
         def admissible(units):
             measure, receipt, _ = self._append_measure(prepared, [*prepared._gp_visible, *units])
             return measure is not None, receipt
+        started = time.perf_counter()
         candidates, supply = supply_candidates(prepared, self.tokenizer, self.gp, context,
             admissible, self.backends)
+        timings["supply_candidates_seconds"] = time.perf_counter() - started
+        started = time.perf_counter()
         actions, rejected_actions = build_legal_sets(candidates, admissible,
             maximum=min(self.gp.get("selector_max_units", self.gp["K"]), self.gp["K"]))
+        timings["build_legal_sets_seconds"] = time.perf_counter() - started
         legacy_gate = (
             self._detector_gate(prepared)
             if self.gp.get("set_selector") == "legacy_prefill"
             else None
         )
+        started = time.perf_counter()
         chosen, selection = select_evidence_set(
             context,
             candidates,
@@ -424,6 +448,9 @@ class GPRecoveryController(EventNativeRecoveryController):
             trained=self.trained_selector,
             legacy_gate=legacy_gate,
         )
+        timings["select_evidence_set_seconds"] = time.perf_counter() - started
+        timings["admission_cache"] = copy.deepcopy(prepared._gp_admission_cache_stats)
+        decision["reconsider_stage_timing"] = timings
         supply.update(selected_ids=list(chosen), actually_appended_ids=[],
             rejection_reason=None if chosen else selection["reason"],
             legal_action_count=len(actions), rejected_actions=rejected_actions)
@@ -475,7 +502,18 @@ class GPRecoveryController(EventNativeRecoveryController):
             prepared._t02_selection = (candidates, actions, copy.deepcopy(decision))
             return {"regenerate": False, "memory": prepared.memory,
                     "metadata": prepared.metadata, "decision": copy.deepcopy(decision)}
-        return self._commit_evidence_set(prepared, candidates, chosen, decision)
+        started = time.perf_counter()
+        result = self._commit_evidence_set(prepared, candidates, chosen, decision)
+        elapsed = time.perf_counter() - started
+        result["decision"].setdefault("reconsider_stage_timing", {})[
+            "commit_evidence_set_seconds"
+        ] = elapsed
+        result["decision"]["reconsider_stage_timing"]["admission_cache"] = copy.deepcopy(
+            prepared._gp_admission_cache_stats
+        )
+        result["metadata"]["exact_recovery"] = copy.deepcopy(result["decision"])
+        prepared._checked_result = _copy_result(result)
+        return result
 
     def hold_selection(self, prepared, draft_tool_calls, *, draft_text, parse_error=None):
         """Expose the actual legal catalog before any evidence is appended."""
@@ -550,6 +588,12 @@ class GPRecoveryController(EventNativeRecoveryController):
         prepared._gp_signature = None
         prepared._shadow_features = copy.deepcopy(shadow_features)
         prepared._features_observed = True
+        prepared._gp_admission_cache = {}
+        prepared._gp_admission_cache_stats = {
+            "hits": 0,
+            "misses": 0,
+            "measure_seconds": 0.0,
+        }
 
     def _detector_gate(self, prepared):
         """Evaluate the frozen detector, optionally replacing only its threshold."""
@@ -685,6 +729,20 @@ class GPRecoveryController(EventNativeRecoveryController):
     def _append_measure(self, prepared, units):
         from .evidence_units import render_units
 
+        cache = getattr(prepared, "_gp_admission_cache", None)
+        stats = getattr(prepared, "_gp_admission_cache_stats", None)
+        key = (
+            int(prepared._gp_round),
+            tuple((unit.unit_id, unit.event_id) for unit in units),
+        )
+        if cache is not None and key in cache:
+            if stats is not None:
+                stats["hits"] += 1
+            return copy.deepcopy(cache[key])
+        if stats is not None:
+            stats["misses"] += 1
+        measure_started = time.perf_counter()
+
         rendered = render_units(units, prepared._store, self.gp["P"], self.gp["order"]) if units else ()
         derived = (*prepared._gp_base_derived, *rendered)
         view = prepared.memory.view
@@ -740,7 +798,12 @@ class GPRecoveryController(EventNativeRecoveryController):
             ),
             "complete_semantic_units_preserved": True,
         }
-        return measure, receipt, derived
+        result = (measure, receipt, derived)
+        if stats is not None:
+            stats["measure_seconds"] += time.perf_counter() - measure_started
+        if cache is not None:
+            cache[key] = copy.deepcopy(result)
+        return result
 
     def _apply_measure(self, prepared, measure, receipt, derived):
         metadata = metadata_after_admission(self._packer, prepared, measure, None, receipt)
@@ -749,6 +812,10 @@ class GPRecoveryController(EventNativeRecoveryController):
         # Spans are exact evidence but do not pretend to cover a full raw event.
         metadata["gp_exact_unit_ids"] = list(receipt["unit_ids"])
         prepared.memory, prepared.metadata = measure.memory, metadata
+        # Applying a measure changes the active workspace. Never reuse an
+        # admission result across that state transition.
+        if hasattr(prepared, "_gp_admission_cache"):
+            prepared._gp_admission_cache.clear()
 
     @staticmethod
     def _finish_gp(prepared, decision, reason, *, regenerate=False):

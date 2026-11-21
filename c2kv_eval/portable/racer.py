@@ -4,8 +4,9 @@ import json, math, sys
 from pathlib import Path
 from typing import Any, Mapping
 
-ARTIFACT = Path("/home/zhuyuhan/project/c2kv/experiments/history_system/artifacts/c1_risk.t02_v1.json")
-_RUNTIME = Path("/home/zhuyuhan/project/c2kv/experiments/history_system/runtime")
+_MONOREPO = Path(__file__).resolve().parents[2]
+ARTIFACT = _MONOREPO / "runtime/artifacts/c1_risk.t02_v1.json"
+_RUNTIME = _MONOREPO / "runtime"
 _RUNTIME_PYTHON = _RUNTIME / "python"
 for _root in (_RUNTIME_PYTHON, _RUNTIME):
     if str(_root) not in sys.path: sys.path.insert(0, str(_root))

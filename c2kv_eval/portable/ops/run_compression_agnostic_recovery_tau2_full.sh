@@ -6,7 +6,7 @@ set -euo pipefail
 # exactly the same task ids in the same order. Recovery is request-local only.
 
 BFCL_ROOT="${BFCL_ROOT:-/home/zhuyuhan/project/bfcl-c2kv}"
-SGLANG_ROOT="${SGLANG_ROOT:-/home/zhuyuhan/project/kvoffload-sglang-c2kv}"
+SGLANG_ROOT="${SGLANG_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)/third_party/sglang}"
 C2KV_ROOT="${C2KV_ROOT:-/home/zhuyuhan/project/c2kv}"
 TAU2_ROOT="${TAU2_ROOT:-/home/zhuyuhan/benchmarks/tau2}"
 CHECKPOINT="${CHECKPOINT:-/home/zhuyuhan/project/model/checkpoints/qwen3-4b-agent-history-c2kv-toolcall-npu-v2/checkpoint-1088}"

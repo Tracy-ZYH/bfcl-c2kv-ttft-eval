@@ -1,0 +1,7 @@
+{
+  "schema": "a-event-native-eval-capacity-v1",
+  "capacity": {
+    "max_workspace_tokens": 258048,
+    "max_sequence_tokens": 262144
+  }
+}

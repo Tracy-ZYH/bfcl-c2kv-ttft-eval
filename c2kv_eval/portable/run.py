@@ -29,6 +29,7 @@ from .adapters.base import RunContext
 from .checkpoint_profile import ProfileError, resolve_checkpoint_profile
 from .capabilities import run_preflight
 from .arms import get_arm
+from .gp_sjcs import is_dynamic_arm
 
 # --benchmark value -> adapter module.  Two names share acon_adapter (the
 # module dispatches on ctx.options["benchmark"]); add_arguments is called
@@ -311,7 +312,8 @@ def main(argv=None):
         query_projection=args.query_projection,
         witness_tokenizer=str(args.tokenizer or args.checkpoint or "")
         if (get_arm(args.arm).gold_recovery or args.recovery_control
-            or get_arm(args.arm).text_policy == "recent_trunc_r25") else "",
+            or get_arm(args.arm).text_policy == "recent_trunc_r25"
+            or is_dynamic_arm(args.arm)) else "",
         python_bin=args.proxy_python, recovery_control=args.recovery_control,
         upstream_timeout=args.upstream_timeout,
         max_completion_tokens=args.max_completion_tokens,

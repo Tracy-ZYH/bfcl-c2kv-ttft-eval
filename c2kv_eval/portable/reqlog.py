@@ -73,6 +73,16 @@ def summarize(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
              if isinstance(r.get("wall_sec"), (int, float))]
     assembly = [float(r["assemble_sec"]) for r in ok
                 if isinstance(r.get("assemble_sec"), (int, float))]
+    ttft_ms = [float(r["server_ttft_ms"]) for r in ok
+               if isinstance(r.get("server_ttft_ms"), (int, float))]
+    online_ttft_ms = [
+        float(r["server_ttft_ms"]) + 1000.0 * float(r.get("assemble_sec") or 0.0)
+        for r in ok if isinstance(r.get("server_ttft_ms"), (int, float))
+    ]
+    controller_ms = [float(r["gp_controller_preparation_ms"]) for r in ok
+                     if isinstance(r.get("gp_controller_preparation_ms"), (int, float))]
+    prefill_ms = [float(r["prefill_path_ms"]) for r in ok
+                  if isinstance(r.get("prefill_path_ms"), (int, float))]
     kv = [r["kv_resident_tokens"] for r in ok if isinstance(r.get("kv_resident_tokens"), int)]
     gist = sum(int(r.get("gist_tokens") or 0) for r in ok)
     original = sum(int(r.get("original_tokens") or 0) for r in ok)
@@ -101,6 +111,22 @@ def summarize(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "dropped_docs_max": max(dropped) if dropped else None,
         "wall_p50": _pct(walls, 0.50),
         "wall_p90": _pct(walls, 0.90),
+        "server_ttft_ms_p50": _pct(ttft_ms, 0.50),
+        "server_ttft_ms_p95": _pct(ttft_ms, 0.95),
+        "server_ttft_ms_count": len(ttft_ms),
+        "server_ttft_ms_total": sum(ttft_ms),
+        "server_ttft_ms_mean": _mean(ttft_ms),
+        "online_ttft_ms_total": sum(online_ttft_ms),
+        "online_ttft_ms_mean": _mean(online_ttft_ms),
+        "online_ttft_ms_p50": _pct(online_ttft_ms, 0.50),
+        "online_ttft_ms_p95": _pct(online_ttft_ms, 0.95),
+        "online_ttft_ms_count": len(online_ttft_ms),
+        "controller_preparation_ms_total": sum(controller_ms),
+        "controller_preparation_ms_mean": _mean(controller_ms),
+        "controller_preparation_ms_p50": _pct(controller_ms, 0.50),
+        "controller_preparation_ms_p95": _pct(controller_ms, 0.95),
+        "prefill_path_ms_p50": _pct(prefill_ms, 0.50),
+        "prefill_path_ms_p95": _pct(prefill_ms, 0.95),
         "gist_tokens_total": gist,
         "gist_tokens_mean": _mean(
             r.get("gist_tokens") for r in ok if (r.get("gist_tokens") or 0) > 0),
@@ -112,6 +138,10 @@ def summarize(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "doc_packing": packings,
     }
     summary["mixed_query_proj"] = len(modes) > 1
+    gp_rows = [r for r in ok if isinstance(r.get("gp_sjcs"), dict)]
+    summary["gp_selected_config_counts"] = dict(Counter(
+        str(r["gp_sjcs"].get("selected_config")) for r in gp_rows))
+    summary["gp_scheduler_request_count"] = len(gp_rows)
     summary["wall_sec_total"] = sum(walls)
     summary["proxy_assembly_sec_total"] = sum(assembly) if assembly else None
     summary["server_total_gpu_kv_bytes_max"] = max(
@@ -209,6 +239,20 @@ def summarize(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     summary["joint_retention"] = active_joint / full_joint if full_joint else None
     summary["joint_compression_ratio"] = (
         full_joint / active_joint if active_joint else None)
+    protected_joint = sum(float(r.get("joint_protected_kv") or 0)
+                          for r in joint_rows)
+    current_joint = sum(float(r.get("joint_current_full_kv") or 0)
+                        for r in joint_rows)
+    summary["joint_protected_kv"] = int(protected_joint)
+    summary["joint_current_full_kv"] = int(current_joint)
+    full_e2e = full_joint + protected_joint + current_joint
+    active_e2e = active_joint + protected_joint + current_joint
+    summary["e2e_full_kv"] = int(full_e2e)
+    summary["e2e_active_kv"] = int(active_e2e)
+    summary["e2e_kv_retention"] = (
+        active_e2e / full_e2e if full_e2e else None)
+    summary["e2e_kv_compression_ratio"] = (
+        full_e2e / active_e2e if active_e2e else None)
     if joint_rows:
         # Legacy physical-eviction counters describe the broad compacted
         # interval (Tool + History + protected gaps). Dividing that resident

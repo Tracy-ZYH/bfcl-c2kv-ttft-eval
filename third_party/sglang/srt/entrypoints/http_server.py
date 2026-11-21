@@ -1,0 +1,3337 @@
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""
+The entry point of inference server. (SRT = SGLang Runtime)
+
+This file implements HTTP APIs for the inference engine via fastapi.
+"""
+
+import asyncio
+import dataclasses
+import logging
+import os
+import tempfile
+import threading
+import time
+from contextlib import asynccontextmanager
+from http import HTTPStatus
+from typing import (
+    Any,
+    AsyncGenerator,
+    AsyncIterator,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Union,
+)
+
+# Fix a bug of Python threading
+setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
+
+
+import numpy as np
+import requests
+import uvicorn
+import uvloop
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import ORJSONResponse, Response, StreamingResponse
+
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
+from sglang.srt.entrypoints.anthropic.protocol import (
+    AnthropicCountTokensRequest,
+    AnthropicMessagesRequest,
+)
+from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
+from sglang.srt.entrypoints.engine import (
+    Engine,
+    init_tokenizer_manager,
+    run_detokenizer_process,
+    run_scheduler_process,
+)
+from sglang.srt.entrypoints.ollama.protocol import (
+    OllamaChatRequest,
+    OllamaGenerateRequest,
+    OllamaShowRequest,
+)
+from sglang.srt.entrypoints.ollama.serving import OllamaServing
+from sglang.srt.entrypoints.openai.protocol import (
+    C2KVExtractRequest,
+    C2KVExtractResponse,
+    C2KVNativePackedGenerateRequest,
+    C2KVRepairExtractRequest,
+    C2KVRepairExtractResponse,
+    C2KVTokenizeRequest,
+    C2KVTokenizeResponse,
+    ChatCompletionRequest,
+    ClassifyRequest,
+    CompletionRequest,
+    DetokenizeRequest,
+    EmbeddingRequest,
+    ErrorResponse,
+    ModelCard,
+    ModelList,
+    ResponsesRequest,
+    ScoringRequest,
+    TokenizeRequest,
+    V1RerankReqInput,
+)
+from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
+from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
+from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
+from sglang.srt.entrypoints.openai.serving_rerank import OpenAIServingRerank
+from sglang.srt.entrypoints.openai.serving_score import OpenAIServingScore
+from sglang.srt.entrypoints.openai.serving_tokenize import (
+    OpenAIServingDetokenize,
+    OpenAIServingTokenize,
+)
+from sglang.srt.entrypoints.openai.serving_transcription import (
+    OpenAIServingTranscription,
+)
+from sglang.srt.entrypoints.warmup import execute_warmups
+from sglang.srt.environ import envs
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.managers.io_struct import (
+    AbortReq,
+    AttachHiCacheStorageReqInput,
+    C2KVSegmentInfo,
+    CheckWeightsReqInput,
+    CloseSessionReqInput,
+    ConfigureLoggingReq,
+    ContinueGenerationReqInput,
+    CreateRecoveryCheckpointReqInput,
+    DestroyWeightsUpdateGroupReqInput,
+    DumperControlReqInput,
+    EmbeddingReqInput,
+    GenerateReqInput,
+    GetRecoveryCheckpointReqInput,
+    GetWeightsByNameReqInput,
+    InitWeightsSendGroupForRemoteInstanceReqInput,
+    InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterFromTensorsReqInput,
+    LoadLoRAAdapterReqInput,
+    OpenSessionReqInput,
+    ParseFunctionCallReq,
+    PauseGenerationReqInput,
+    ProfileReqInput,
+    ReleaseRecoveryCheckpointReqInput,
+    ReleaseMemoryOccupationReqInput,
+    RestoreRecoveryCheckpointReqInput,
+    ResumeMemoryOccupationReqInput,
+    SendWeightsToRemoteInstanceReqInput,
+    SeparateReasoningReqInput,
+    SetInternalStateReq,
+    SlowDownReqInput,
+    UnloadLoRAAdapterReqInput,
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromIPCReqInput,
+    UpdateWeightsFromTensorReqInput,
+    UpdateWeightVersionReqInput,
+    VertexGenerateReqInput,
+)
+from sglang.srt.mem_cache.c2kv_native_packed import (
+    NATIVE_PACKED_CAPABILITY_SCHEMA,
+    NATIVE_PACKED_RESPONSE_SCHEMA,
+    PACKING_VERSION as C2KV_NATIVE_PACKING_VERSION,
+    RAW_LAYOUT_PROFILE as C2KV_NATIVE_RAW_LAYOUT_PROFILE,
+    canonical_model_binding,
+    float16_roundtrip,
+    plan_native_packed_request,
+)
+from sglang.srt.managers.multi_tokenizer_mixin import (
+    MultiTokenizerRouter,
+    TokenizerWorker,
+    get_main_process_id,
+    monkey_patch_uvicorn_multiprocessing,
+    read_from_shared_memory,
+    write_data_for_multi_tokenizer,
+)
+from sglang.srt.managers.template_manager import TemplateManager
+from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
+from sglang.srt.observability.func_timer import enable_func_timer
+from sglang.srt.observability.trace import (
+    process_tracing_init,
+    set_global_trace_level,
+    trace_set_thread_info,
+)
+from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.utils import (
+    add_prometheus_middleware,
+    add_prometheus_track_response_middleware,
+    delete_directory,
+    get_bool_env_var,
+    kill_process_tree,
+    set_uvicorn_logging_configs,
+)
+from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth_level
+from sglang.srt.utils.json_response import (
+    SGLangORJSONResponse,
+    dumps_json,
+    orjson_response,
+)
+from sglang.srt.utils.watchdog import SubprocessWatchdog
+from sglang.utils import get_exception_traceback
+from sglang.version import __version__
+
+logger = logging.getLogger(__name__)
+asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+
+# Global constants
+HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
+WAIT_WEIGHTS_READY_TIMEOUT = int(os.getenv("SGLANG_WAIT_WEIGHTS_READY_TIMEOUT", 120))
+
+
+# Store global states
+@dataclasses.dataclass
+class _GlobalState:
+    tokenizer_manager: Union[TokenizerManager, MultiTokenizerRouter, TokenizerWorker]
+    template_manager: TemplateManager
+    scheduler_info: Dict
+
+
+_global_state: Optional[_GlobalState] = None
+
+
+def set_global_state(global_state: _GlobalState):
+    global _global_state
+    _global_state = global_state
+
+
+def get_global_state() -> _GlobalState:
+    return _global_state
+
+
+async def init_multi_tokenizer() -> ServerArgs:
+    """
+    Initialization function for multi-process tokenizer mode.
+    It read args information from shm and inits tokenizer manager for current process.
+    """
+
+    # Read configuration from shared memory
+    main_pid = get_main_process_id()
+    port_args, server_args, scheduler_info = read_from_shared_memory(
+        f"multi_tokenizer_args_{main_pid}"
+    )
+    server_args: ServerArgs
+    port_args: PortArgs
+
+    # API key authentication is not supported in multi-tokenizer mode
+    assert (
+        server_args.api_key is None
+    ), "API key is not supported in multi-tokenizer mode"
+
+    # Create a new ipc name for the current process
+    port_args.tokenizer_ipc_name = (
+        f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+    )
+    logger.info(
+        f"Start multi-tokenizer worker process {os.getpid()}, "
+        f"ipc_name={port_args.tokenizer_ipc_name}"
+    )
+
+    # Launch multi-tokenizer manager process
+    tokenizer_manager = TokenizerWorker(server_args, port_args)
+    template_manager = TemplateManager()
+    template_manager.initialize_templates(
+        tokenizer_manager=tokenizer_manager,
+        model_path=server_args.model_path,
+        chat_template=server_args.chat_template,
+        completion_template=server_args.completion_template,
+    )
+
+    tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+
+    set_global_state(
+        _GlobalState(
+            tokenizer_manager=tokenizer_manager,
+            template_manager=template_manager,
+            scheduler_info=scheduler_info,
+        )
+    )
+
+    return server_args
+
+
+@asynccontextmanager
+async def lifespan(fast_api_app: FastAPI):
+    if getattr(fast_api_app, "is_single_tokenizer_mode", False):
+        server_args = fast_api_app.server_args
+        warmup_thread_kwargs = fast_api_app.warmup_thread_kwargs
+        thread_label = "Tokenizer"
+    else:
+        # Initialize multi-tokenizer support for worker processes
+        server_args = await init_multi_tokenizer()
+        warmup_thread_kwargs = dict(server_args=server_args)
+        thread_label = f"MultiTokenizer-{_global_state.tokenizer_manager.worker_id}"
+
+    # Add prometheus middleware
+    if server_args.enable_metrics:
+        add_prometheus_middleware(app)
+        enable_func_timer()
+
+    # Init tracing
+    if server_args.enable_trace:
+        process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+        if server_args.disaggregation_mode == "prefill":
+            thread_label = "Prefill" + thread_label
+        elif server_args.disaggregation_mode == "decode":
+            thread_label = "Decode" + thread_label
+        trace_set_thread_info(thread_label)
+
+    # Initialize OpenAI serving handlers
+    fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
+        _global_state.tokenizer_manager, _global_state.template_manager
+    )
+    fast_api_app.state.openai_serving_chat = OpenAIServingChat(
+        _global_state.tokenizer_manager, _global_state.template_manager
+    )
+    fast_api_app.state.openai_serving_embedding = OpenAIServingEmbedding(
+        _global_state.tokenizer_manager, _global_state.template_manager
+    )
+    fast_api_app.state.openai_serving_classify = OpenAIServingClassify(
+        _global_state.tokenizer_manager, _global_state.template_manager
+    )
+    fast_api_app.state.openai_serving_score = OpenAIServingScore(
+        _global_state.tokenizer_manager
+    )
+    fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
+        _global_state.tokenizer_manager, _global_state.template_manager
+    )
+    fast_api_app.state.openai_serving_tokenize = OpenAIServingTokenize(
+        _global_state.tokenizer_manager
+    )
+    fast_api_app.state.openai_serving_detokenize = OpenAIServingDetokenize(
+        _global_state.tokenizer_manager
+    )
+    fast_api_app.state.openai_serving_transcription = OpenAIServingTranscription(
+        _global_state.tokenizer_manager
+    )
+
+    # Initialize Ollama-compatible serving handler
+    fast_api_app.state.ollama_serving = OllamaServing(_global_state.tokenizer_manager)
+
+    # Initialize Anthropic-compatible serving handler
+    fast_api_app.state.anthropic_serving = AnthropicServing(
+        fast_api_app.state.openai_serving_chat
+    )
+
+    # Launch tool server
+    tool_server = None
+    if server_args.tool_server == "demo":
+        from sglang.srt.entrypoints.openai.tool_server import DemoToolServer
+
+        tool_server = DemoToolServer()
+    elif server_args.tool_server:
+        from sglang.srt.entrypoints.openai.tool_server import MCPToolServer
+
+        tool_server = MCPToolServer()
+        await tool_server.add_tool_server(server_args.tool_server)
+
+    try:
+        from sglang.srt.entrypoints.openai.serving_responses import (
+            OpenAIServingResponses,
+        )
+
+        fast_api_app.state.openai_serving_responses = OpenAIServingResponses(
+            _global_state.tokenizer_manager,
+            _global_state.template_manager,
+            enable_prompt_tokens_details=True,
+            tool_server=tool_server,
+        )
+    except Exception:
+        traceback = get_exception_traceback()
+        logger.warning(f"Can not initialize OpenAIServingResponses, error: {traceback}")
+
+    # Execute custom warmups
+    if server_args.warmups is not None:
+        await execute_warmups(
+            server_args.disaggregation_mode,
+            server_args.warmups.split(","),
+            _global_state.tokenizer_manager,
+        )
+        logger.info("Warmup ended")
+
+    # Execute the general warmup
+    warmup_thread = threading.Thread(
+        target=_wait_and_warmup,
+        kwargs=warmup_thread_kwargs,
+    )
+    warmup_thread.start()
+
+    # Start the HTTP server
+    try:
+        yield
+    finally:
+        warmup_thread.join()
+
+
+# Fast API
+app = FastAPI(
+    lifespan=lifespan,
+    openapi_url=None if get_bool_env_var("DISABLE_OPENAPI_DOC") else "/openapi.json",
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Include routers
+from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
+
+app.include_router(v1_loads_router)
+
+
+@app.exception_handler(HTTPException)
+async def validation_exception_handler(request: Request, exc: HTTPException):
+    """Enrich HTTP exception with status code and other details.
+
+    For /v1/responses, emit OpenAI-style nested error envelope:
+    {"error": {"message": "...", "type": "...", "param": null, "code": <status>}}
+    """
+    # adjust fmt for responses api
+    if request.url.path.startswith("/v1/responses"):
+        nested_error = {
+            "message": exc.detail,
+            "type": HTTPStatus(exc.status_code).phrase,
+            "param": None,
+            "code": exc.status_code,
+        }
+        return ORJSONResponse(
+            content={"error": nested_error}, status_code=exc.status_code
+        )
+
+    error = ErrorResponse(
+        object="error",
+        message=exc.detail,
+        type=str(exc.status_code),
+        code=exc.status_code,
+    )
+    return ORJSONResponse(content=error.model_dump(), status_code=exc.status_code)
+
+
+# Custom exception handlers to change validation error status codes
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Override FastAPI's default 422 validation error with 400.
+
+    For /v1/responses, emit OpenAI-style nested error envelope; for other endpoints keep legacy format.
+    """
+    exc_str = str(exc)
+    errors_str = str(exc.errors())
+
+    if errors_str and errors_str != exc_str:
+        message = f"{exc_str} {errors_str}"
+    else:
+        message = exc_str
+
+    if request.url.path.startswith("/v1/responses"):
+        # adapt specially, for v1/responses API only (notice the error key is different)
+        nested_error = {
+            "message": message,
+            "type": HTTPStatus.BAD_REQUEST.phrase,
+            "param": None,
+            "code": HTTPStatus.BAD_REQUEST.value,
+        }
+        return ORJSONResponse(status_code=400, content={"error": nested_error})
+
+    err = ErrorResponse(
+        message=message,
+        type=HTTPStatus.BAD_REQUEST.phrase,
+        code=HTTPStatus.BAD_REQUEST.value,
+    )
+
+    return ORJSONResponse(
+        status_code=400,
+        content=err.model_dump(),
+    )
+
+
+async def validate_json_request(raw_request: Request):
+    """Validate that the request content-type is application/json."""
+    content_type = raw_request.headers.get("content-type", "").lower()
+    media_type = content_type.split(";", maxsplit=1)[0]
+    if media_type != "application/json":
+        raise RequestValidationError(
+            errors=[
+                {
+                    "loc": ["header", "content-type"],
+                    "msg": "Unsupported Media Type: Only 'application/json' is allowed",
+                    "type": "value_error",
+                }
+            ]
+        )
+
+
+##### Native API endpoints #####
+
+
+@app.get("/health")
+@app.get("/health_generate")
+async def health_generate(request: Request) -> Response:
+    """
+    Check the health of the inference server by sending a special request to generate one token.
+
+    If the server is running something, this request will be ignored, so it creates zero overhead.
+    If the server is not running anything, this request will be run, so we know whether the server is healthy.
+    """
+
+    if _global_state.tokenizer_manager.gracefully_exit:
+        logger.info("Health check request received during shutdown. Returning 503.")
+        return Response(status_code=503)
+
+    if _global_state.tokenizer_manager.server_status == ServerStatus.Starting:
+        return Response(status_code=503)
+
+    if (
+        not envs.SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION.get()
+        and request.url.path == "/health"
+    ):
+        return Response(status_code=200)
+
+    sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
+    rid = f"{HEALTH_CHECK_RID_PREFIX}_{time.time()}"
+
+    if _global_state.tokenizer_manager.is_generation:
+        gri = GenerateReqInput(
+            rid=rid,
+            input_ids=[0],
+            sampling_params=sampling_params,
+            log_metrics=False,
+        )
+        if (
+            _global_state.tokenizer_manager.server_args.disaggregation_mode
+            != DisaggregationMode.NULL.value
+        ):
+            gri.bootstrap_host = FAKE_BOOTSTRAP_HOST
+            gri.bootstrap_room = 0
+    else:
+        gri = EmbeddingReqInput(
+            rid=rid, input_ids=[0], sampling_params=sampling_params, log_metrics=False
+        )
+
+    async def gen():
+        async for _ in _global_state.tokenizer_manager.generate_request(gri, request):
+            break
+
+    task = asyncio.create_task(gen())
+
+    # As long as we receive any response from the detokenizer/scheduler, we consider the server is healthy.
+    tic = time.time()
+    while time.time() < tic + HEALTH_CHECK_TIMEOUT:
+        await asyncio.sleep(1)
+        if _global_state.tokenizer_manager.last_receive_tstamp > tic:
+            task.cancel()
+            _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
+            _global_state.tokenizer_manager.server_status = ServerStatus.Up
+            return Response(status_code=200)
+
+    task.cancel()
+    tic_time = time.strftime("%H:%M:%S", time.localtime(tic))
+    last_receive_time = time.strftime(
+        "%H:%M:%S", time.localtime(_global_state.tokenizer_manager.last_receive_tstamp)
+    )
+    logger.error(
+        f"Health check failed. Server couldn't get a response from detokenizer for last "
+        f"{HEALTH_CHECK_TIMEOUT} seconds. tic start time: {tic_time}. "
+        f"last_heartbeat time: {last_receive_time}"
+    )
+    _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
+    _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
+    return Response(status_code=503)
+
+
+@app.get("/get_model_info")
+async def get_model_info():
+    """Get the model information (deprecated - use /model_info instead)."""
+    logger.warning(
+        "Endpoint '/get_model_info' is deprecated and will be removed in a future version. "
+        "Please use '/model_info' instead."
+    )
+    return await model_info()
+
+
+@app.get("/model_info")
+async def model_info():
+    """Get the model information."""
+    model_config = _global_state.tokenizer_manager.model_config
+    result = {
+        "model_path": _global_state.tokenizer_manager.model_path,
+        "served_model_name": _global_state.tokenizer_manager.served_model_name,
+        "tokenizer_path": _global_state.tokenizer_manager.server_args.tokenizer_path,
+        "is_generation": _global_state.tokenizer_manager.is_generation,
+        "preferred_sampling_params": _global_state.tokenizer_manager.server_args.preferred_sampling_params,
+        "weight_version": _global_state.tokenizer_manager.server_args.weight_version,
+        "has_image_understanding": model_config.is_image_understandable_model,
+        "has_audio_understanding": model_config.is_audio_understandable_model,
+        "model_type": getattr(model_config.hf_config, "model_type", None),
+        "architectures": getattr(model_config.hf_config, "architectures", None),
+        "model_dimensions": {
+            key: getattr(model_config.hf_config, key, None)
+            for key in ("hidden_size", "intermediate_size", "num_hidden_layers",
+                        "num_attention_heads", "num_key_value_heads", "head_dim", "vocab_size")
+        },
+        "weight_version": _global_state.tokenizer_manager.server_args.weight_version,
+        "c2kv_native_packed": _c2kv_native_capability(),
+        # "hf_config": model_config.hf_config.to_dict(),
+    }
+    return result
+
+
+@app.get("/get_weight_version")
+@app.get("/weight_version")
+async def weight_version():
+    """Get the current weight version."""
+    raise HTTPException(
+        status_code=404,
+        detail="Endpoint '/get_weight_version' or '/weight_version' is deprecated. Please use '/model_info' instead.",
+    )
+
+
+@app.get("/get_server_info")
+async def get_server_info():
+    """Get the server information (deprecated - use /server_info instead)."""
+    logger.warning(
+        "Endpoint '/get_server_info' is deprecated and will be removed in a future version. "
+        "Please use '/server_info' instead."
+    )
+    return await server_info()
+
+
+@app.get("/server_info")
+async def server_info():
+    """Get the server information."""
+    # Returns internal states per DP.
+    internal_states: List[Dict[Any, Any]] = (
+        await _global_state.tokenizer_manager.get_internal_state()
+    )
+
+    # This field is not serializable.
+    if hasattr(_global_state.tokenizer_manager.server_args, "model_config"):
+        del _global_state.tokenizer_manager.server_args.model_config
+
+    return {
+        **dataclasses.asdict(_global_state.tokenizer_manager.server_args),
+        **_global_state.scheduler_info,
+        "internal_states": internal_states,
+        "version": __version__,
+    }
+
+
+@app.get("/get_load")
+async def get_load():
+    """Get load metrics (deprecated - use /v1/loads instead)."""
+    logger.warning(
+        "Endpoint '/get_load' is deprecated and will be removed in a future version. "
+        "Please use '/v1/loads' instead."
+    )
+    return await _global_state.tokenizer_manager.get_load()
+
+
+# example usage:
+# curl -s -X POST http://localhost:30000/set_internal_state -H "Content-Type: application/json" -d '{"server_args": {"pp_max_micro_batch_size": 8}}'
+@app.api_route("/set_internal_state", methods=["POST", "PUT"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def set_internal_state(obj: SetInternalStateReq, request: Request):
+    res = await _global_state.tokenizer_manager.set_internal_state(obj)
+    return res
+
+
+# Do not import `dumper.py` to avoid dependency
+if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
+
+    @app.api_route("/dumper/{method}", methods=["POST"])
+    @auth_level(AuthLevel.ADMIN_OPTIONAL)
+    async def _dumper_control_handler(method: str, request: Request):
+        body_bytes = await request.body()
+        body = await request.json() if body_bytes else {}
+        obj = DumperControlReqInput(method=method, body=body)
+        results = await _global_state.tokenizer_manager.dumper_control(obj)
+        if any(not r.success for r in results):
+            errors = [r.error for r in results if not r.success]
+            return ORJSONResponse(status_code=400, content={"error": errors})
+        return [x for result in results for x in result.response]
+
+
+# fastapi implicitly converts json in the request to obj (dataclass)
+@app.api_route(
+    "/generate",
+    methods=["POST", "PUT"],
+    response_class=SGLangORJSONResponse,
+)
+async def generate_request(obj: GenerateReqInput, request: Request):
+    """Handle a generate request."""
+    if obj.stream:
+
+        async def stream_results() -> AsyncIterator[bytes]:
+            try:
+                async for out in _global_state.tokenizer_manager.generate_request(
+                    obj, request
+                ):
+                    yield b"data: " + dumps_json(out) + b"\n\n"
+            except ValueError as e:
+                out = {"error": {"message": str(e)}}
+                logger.error(f"[http_server] Error: {e}")
+                yield b"data: " + dumps_json(out) + b"\n\n"
+            yield b"data: [DONE]\n\n"
+
+        return StreamingResponse(
+            stream_results(),
+            media_type="text/event-stream",
+            background=_global_state.tokenizer_manager.create_abort_task(obj),
+        )
+    else:
+        try:
+            ret = await _global_state.tokenizer_manager.generate_request(
+                obj, request
+            ).__anext__()
+            return orjson_response(ret)
+        except ValueError as e:
+            logger.error(f"[http_server] Error: {e}")
+            return _create_error_response(e)
+
+
+def _c2kv_dtype_nbytes(dtype_name: str) -> int:
+    normalized = str(dtype_name).replace("torch.", "").lower()
+    if normalized in {"float64", "int64"}:
+        return 8
+    if normalized in {"float32", "int32"}:
+        return 4
+    if normalized in {"float16", "bfloat16", "int16"}:
+        return 2
+    if normalized in {
+        "float8_e4m3fn",
+        "float8_e5m2",
+        "fp8_e4m3",
+        "fp8_e5m2",
+        "int8",
+        "uint8",
+    }:
+        return 1
+    raise ValueError(f"Unsupported C2KV KV dtype for accounting: {dtype_name!r}")
+
+
+def _c2kv_tool_gist_capability(server_args) -> Dict[str, Any]:
+    """The optional second ("tool") gist set, as clients must bind to it.
+
+    ``identity`` is the same string the model process attaches to every
+    extraction key of that set (``c2kv_tool_gist_identity``), derived from
+    the checkpoint's on-disk metadata, so no model RPC is needed here.
+    """
+    source = getattr(server_args, "c2kv_tool_gist_weights", None)
+    if not source:
+        return {"enabled": False, "source": None, "identity": None, "metadata": None}
+    import json as _json
+    import hashlib as _hashlib
+
+    from sglang.srt.mem_cache.c2kv_semantics import c2kv_tool_gist_identity
+
+    with open(os.path.join(source, "config.json"), "r", encoding="utf-8") as handle:
+        config = _json.load(handle)
+    with open(os.path.join(source, "config.json"), "rb") as handle:
+        config_sha256 = _hashlib.sha256(handle.read()).hexdigest()
+    metadata = {
+        key: value
+        for key, value in config.items()
+        if key.startswith("history_memory_") or key.startswith("gist_")
+    }
+    return {
+        "enabled": True,
+        "source": str(source),
+        "identity": c2kv_tool_gist_identity(source),
+        "metadata": metadata,
+        "config_sha256": config_sha256,
+        "extract_projection_set": "tool",
+    }
+
+
+def _c2kv_native_capability() -> Dict[str, Any]:
+    tokenizer_manager = _global_state.tokenizer_manager
+    server_args = tokenizer_manager.server_args
+    model_config = tokenizer_manager.model_config
+    hf_config = getattr(model_config, "hf_text_config", None) or getattr(
+        model_config, "hf_config", None
+    )
+    dtype_name = str(getattr(model_config, "dtype", server_args.dtype)).replace(
+        "torch.", ""
+    )
+    configured_kv_dtype = str(getattr(server_args, "kv_cache_dtype", "auto"))
+    effective_kv_dtype = (
+        dtype_name if configured_kv_dtype in {"", "auto", "None"} else configured_kv_dtype
+    )
+    shadow_layer = getattr(server_args, "c2kv_shadow_feature_layer", None)
+    num_layers = int(getattr(model_config, "num_hidden_layers", 0))
+    normalized_shadow_layer = None
+    if shadow_layer is not None:
+        normalized_shadow_layer = (
+            int(shadow_layer) if int(shadow_layer) >= 0 else num_layers + int(shadow_layer)
+        )
+    model_binding = canonical_model_binding(
+        model_path=tokenizer_manager.model_path,
+        tokenizer_path=getattr(server_args, "tokenizer_path", None),
+        weight_version=getattr(server_args, "weight_version", None),
+        dtype=dtype_name,
+        kv_cache_dtype=effective_kv_dtype,
+        gist_parameter_dtype="float32",
+        gist_compute_dtype=dtype_name,
+        gist_type=getattr(server_args, "c2kv_gist_type", "dynamic-interleave"),
+        gist_param=getattr(server_args, "c2kv_gist_param", "qkv"),
+        gist_extra_embed_num=getattr(hf_config, "gist_extra_embed_num", 1),
+        gist_residual_type=getattr(hf_config, "gist_residual_type", "none"),
+        gist_overlap=getattr(hf_config, "gist_overlap", 0),
+        pic_enabled=bool(getattr(hf_config, "pic_enabled", False)),
+        pic_param=getattr(hf_config, "pic_param", "qkv"),
+        # The event-native endpoint always selects the frozen C1000 base-query
+        # path independently of the generic chat endpoint's server default.
+        query_projection="base",
+    )
+    num_kv_heads = int(getattr(model_config, "num_key_value_heads", 0))
+    head_dim = int(getattr(model_config, "head_dim", 0))
+    value_head_dim = int(getattr(model_config, "v_head_dim", head_dim))
+    kv_bytes_per_token = (
+        num_layers
+        * num_kv_heads
+        * (head_dim + value_head_dim)
+        * _c2kv_dtype_nbytes(effective_kv_dtype)
+    )
+    return {
+        "schema": NATIVE_PACKED_CAPABILITY_SCHEMA,
+        "enabled": bool(getattr(server_args, "enable_c2kv", False)),
+        "endpoint": "/v1/c2kv/native_generate",
+        "packing_version": C2KV_NATIVE_PACKING_VERSION,
+        "raw_layout_profile": C2KV_NATIVE_RAW_LAYOUT_PROFILE,
+        "model_binding": model_binding,
+        "tool_gist": _c2kv_tool_gist_capability(server_args),
+        "parameter_version": model_binding["weight_version"],
+        "kv_bytes_per_token": kv_bytes_per_token,
+        "num_hidden_layers": num_layers,
+        "num_key_value_heads": num_kv_heads,
+        "head_dim": head_dim,
+        "value_head_dim": value_head_dim,
+        "shadow_feature_layer": normalized_shadow_layer,
+        "shadow_feature_readout": "decoder_layer_output",
+        "shadow_feature_stored_dtype": "float16",
+        "gist_parameter_dtype": "float32",
+        "gist_compute_dtype": dtype_name,
+        "base_query_enforced": True,
+        "sampling_profiles": ["greedy-v1", "acebench-agent-v1"],
+        "server_default_query_projection": getattr(
+            server_args, "c2kv_query_proj", "base"
+        ),
+    }
+
+
+def _c2kv_native_sampling_params(
+    request: C2KVNativePackedGenerateRequest,
+) -> Dict[str, Any]:
+    """Validate the named native sampler without changing accepted parameters."""
+
+    sampling_params = dict(request.sampling_params)
+    if sampling_params.get("n", 1) != 1:
+        raise ValueError("C2KV native packed generation supports only n=1")
+    if sampling_params.get("max_new_tokens", 0) <= 0:
+        raise ValueError("sampling_params.max_new_tokens must be positive")
+
+    if request.sampling_profile == "acebench-agent-v1":
+        allowed = {"max_new_tokens", "temperature", "top_p", "stop_token_ids", "n"}
+        unexpected = set(sampling_params) - allowed
+        if unexpected:
+            raise ValueError(
+                "ACEBench Agent native sampling profile disallows: "
+                + ", ".join(sorted(unexpected))
+            )
+        if (
+            type(sampling_params.get("temperature")) not in (int, float)
+            or float(sampling_params["temperature"]) != 0.001
+            or type(sampling_params.get("top_p")) not in (int, float)
+            or float(sampling_params["top_p"]) != 1.0
+        ):
+            raise ValueError(
+                "ACEBench Agent native sampling profile requires "
+                "temperature=0.001 and top_p=1"
+            )
+    elif request.sampling_profile == "greedy-v1":
+        sampling_params.setdefault("temperature", 0.0)
+        if float(sampling_params["temperature"]) != 0.0:
+            raise ValueError("C2KV native packed generation requires greedy decoding")
+    else:
+        raise ValueError("Unknown C2KV native sampling profile")
+    return sampling_params
+
+
+def _c2kv_native_whole_full_measurement(request, plan):
+    """Use the raw Full renderer count when tool KV changes the prompt frame."""
+    supplied = request.paper_whole_full_kv_tokens
+    if supplied is not None:
+        if type(supplied) is not int or supplied <= 0:
+            raise ValueError("paper_whole_full_kv_tokens must be a positive integer")
+        return supplied, "client_native_full_renderer"
+    has_tool_memory = bool(request.raw_tool_segments or request.tool_gist_segments)
+    has_tool_memory |= any(
+        chunk.projection_set == "tool"
+        for chunk in (*request.encoder_chunks, *request.compression_chunks)
+    )
+    if has_tool_memory:
+        return None, "unknown_missing_client_native_full_renderer"
+    return len(plan.logical_input_ids), "native_logical_input_ids"
+
+
+@app.post("/v1/c2kv/native_generate", response_class=SGLangORJSONResponse)
+async def v1_c2kv_native_generate(
+    request: C2KVNativePackedGenerateRequest, raw_request: Request
+):
+    """Generate from exact event-native token IDs and cached gist chunks."""
+
+    speed_request_started = time.perf_counter()
+    try:
+        tokenizer_manager = _global_state.tokenizer_manager
+        capability = _c2kv_native_capability()
+        if not capability["enabled"]:
+            raise ValueError("C2KV native packed generation requires --enable-c2kv")
+        if capability["model_binding"]["pic_enabled"]:
+            raise ValueError(
+                "C2KV native packed generation requires gist compression, not PIC"
+            )
+        if request.max_extraction_calls < 0:
+            raise ValueError("max_extraction_calls must be nonnegative")
+        if request.max_tool_extraction_calls is not None and request.max_tool_extraction_calls < 0:
+            raise ValueError("max_tool_extraction_calls must be nonnegative")
+        sampling_params = _c2kv_native_sampling_params(request)
+
+        shadow_request = request.shadow_features
+        shadow_enabled = bool(
+            shadow_request is not None and shadow_request.get("enabled", True)
+        )
+        normalized_shadow_layer = capability["shadow_feature_layer"]
+        if shadow_enabled:
+            requested_layer = shadow_request.get("prefill_layer")
+            if type(requested_layer) is not int:
+                raise ValueError(
+                    "shadow_features.prefill_layer must be an integer when enabled"
+                )
+            num_layers = capability["num_hidden_layers"]
+            requested_normalized = (
+                requested_layer
+                if requested_layer >= 0
+                else num_layers + requested_layer
+            )
+            if requested_normalized != normalized_shadow_layer:
+                raise ValueError(
+                    "C2KV_NATIVE_SHADOW_LAYER_MISMATCH: requested layer "
+                    f"{requested_layer} resolves to {requested_normalized}, but "
+                    f"the server captures {normalized_shadow_layer}"
+                )
+
+        encoder_chunks = [chunk.model_dump() for chunk in request.encoder_chunks]
+        compression_chunks = [
+            chunk.model_dump() for chunk in request.compression_chunks
+        ]
+        speed_plan_started_ns = time.perf_counter_ns()
+        plan = plan_native_packed_request(
+            system_input_ids=request.system_input_ids,
+            workspace_input_ids=request.workspace_input_ids,
+            encoder_chunks=encoder_chunks,
+            compression_chunks=compression_chunks,
+            model_binding=capability["model_binding"],
+            packing_version=request.packing_version,
+            raw_layout_profile=request.raw_layout_profile,
+            encoding_scope=request.encoding_scope,
+            compression_ratio=request.compression_ratio,
+            # Absent on capability dicts built before the tool set existed:
+            # then only history chunks can be planned.
+            tool_binding=capability.get("tool_gist"),
+            raw_tool_segments=[item.model_dump() for item in request.raw_tool_segments],
+            tool_gist_segments=[item.model_dump() for item in request.tool_gist_segments],
+        )
+        native_plan_ms = (time.perf_counter_ns() - speed_plan_started_ns) / 1e6
+        paper_whole_full, paper_whole_full_source = (
+            _c2kv_native_whole_full_measurement(request, plan)
+        )
+
+        resolved: Dict[str, Dict[str, Any]] = {}
+        cache_hits = 0
+        cache_misses = 0
+        projection_misses = {"tool": 0, "history": 0}
+        materialized_encoder_tokens = 0
+        scope_reused_encoder_tokens = 0
+        base_rid = request.rid or f"c2kv-native-{time.time_ns()}"
+        outer_request_id = (
+            raw_request.headers.get("X-C2KV-Measurement-Request-Id")
+            or request.generation_id
+            or base_rid
+        )
+        measurement_phase_prefix = (
+            raw_request.headers.get("X-C2KV-Measurement-Phase") or "c2kv_native"
+        )
+        extraction_phase = f"{measurement_phase_prefix}:extraction"
+        generation_phase = f"{measurement_phase_prefix}:generation"
+        extraction_telemetry = []
+        cache_hit_lookup_load_ms = 0.0
+        cache_miss_extraction_ms = 0.0
+        for index, chunk in enumerate(plan.unique_chunks):
+            extraction_rid = f"{base_rid}:extract:{index}"
+            projection = chunk.get("projection_set") or "history"
+            if request.max_tool_extraction_calls is None:
+                allow_cache_miss = cache_misses < request.max_extraction_calls
+            else:
+                projection_budget = request.max_tool_extraction_calls if projection == "tool" else request.max_extraction_calls
+                allow_cache_miss = projection_misses[projection] < projection_budget
+            extract_call_started_ns = time.perf_counter_ns()
+            result = await tokenizer_manager.c2kv_extract(
+                input_ids=list(chunk["token_ids"]),
+                input_text="",
+                compression_ratio=chunk.get("compression_ratio") or request.compression_ratio,
+                rid=extraction_rid,
+                allow_cache_miss=allow_cache_miss,
+                outer_request_id=outer_request_id,
+                measurement_phase=extraction_phase,
+                projection_set=chunk.get("projection_set") or "history",
+            )
+            extract_call_duration_ns = time.perf_counter_ns() - extract_call_started_ns
+            if not result.success:
+                raise ValueError(result.error)
+            if result.original_seq_len != len(chunk["token_ids"]):
+                raise ValueError(
+                    "C2KV native extraction returned an inconsistent source length: "
+                    f"{result.original_seq_len} != {len(chunk['token_ids'])}"
+                )
+            if projection == "tool":
+                ratio = chunk.get("compression_ratio") or request.compression_ratio
+                expected_gist_len = (len(chunk["token_ids"]) + ratio - 1) // ratio
+                if result.gist_len != expected_gist_len:
+                    raise ValueError("C2KV_NATIVE_TOOL_GIST_LENGTH_MISMATCH")
+            cache_hit = bool(result.cache_hit)
+            if cache_hit:
+                cache_hits += 1
+                scope_reused_encoder_tokens += len(chunk["token_ids"])
+            else:
+                cache_misses += 1
+                projection_misses[projection] += 1
+                materialized_encoder_tokens += len(chunk["token_ids"])
+            if cache_hit:
+                cache_hit_lookup_load_ms += extract_call_duration_ns / 1e6
+            else:
+                cache_miss_extraction_ms += extract_call_duration_ns / 1e6
+            resolved[chunk["handle"]] = {
+                "chunk_id": chunk["chunk_id"],
+                "handle": chunk["handle"],
+                "cache_key": result.key_hash,
+                "cache_hit": cache_hit,
+                "gist_len": result.gist_len,
+                "original_seq_len": result.original_seq_len,
+                "request_id": extraction_rid,
+                "extraction_duration_ns": result.extraction_duration_ns,
+                "gist_generation_duration_ns": (
+                    result.gist_generation_duration_ns
+                ),
+            }
+            extraction_telemetry.append(
+                {
+                    "chunk_id": chunk["chunk_id"],
+                    "handle": chunk["handle"],
+                    "outer_request_id": outer_request_id,
+                    "server_request_id": extraction_rid,
+                    "phase": extraction_phase,
+                    "host_call_duration_ns": extract_call_duration_ns,
+                    "cache_hit": cache_hit,
+                    "extraction_duration_ns": result.extraction_duration_ns,
+                    "gist_generation_duration_ns": (
+                        result.gist_generation_duration_ns
+                    ),
+                    "paper_measurement": result.paper_measurement,
+                }
+            )
+
+        speed_assembly_started_ns = time.perf_counter_ns()
+        segments = []
+        chunks_by_handle = {item["handle"]: item for item in plan.unique_chunks}
+        for handle, (token_start, token_end) in zip(
+            plan.selected_handles, plan.segment_boundaries
+        ):
+            segments.append(
+                C2KVSegmentInfo(
+                    key_hash=resolved[handle]["cache_key"],
+                    token_start=token_start,
+                    token_end=token_end,
+                    use_gist_projection=False,
+                    region="tool" if chunks_by_handle[handle].get("projection_set") == "tool" else None,
+                    source_token_count=len(chunks_by_handle[handle]["token_ids"]) if chunks_by_handle[handle].get("projection_set") == "tool" else None,
+                )
+            )
+
+        for item in request.raw_tool_segments:
+            segments.append(C2KVSegmentInfo(
+                token_start=item.token_start,
+                token_end=item.token_end,
+                repair_key_hashes=list(item.repair_key_hashes),
+                repair_placement=item.repair_placement,
+                use_gist_projection=False,
+                region="tool",
+                source_token_count=item.token_end - item.token_start,
+                source_token_end=item.token_end,
+                expected_token_len=item.token_len,
+            ))
+        if request.tool_gist_segments or request.raw_tool_segments:
+            segments.sort(key=lambda segment: (segment.token_start, segment.token_end != segment.token_start))
+
+        history_chunks = [chunk for chunk in encoder_chunks if chunk.get("projection_set") != "tool"]
+        history_source_tokens = sum(len(chunk["token_ids"]) for chunk in history_chunks)
+        history_gist_tokens = sum((len(chunk["token_ids"]) + (chunk.get("compression_ratio") or request.compression_ratio) - 1)
+                                 // (chunk.get("compression_ratio") or request.compression_ratio) for chunk in history_chunks)
+
+        native_request_assembly_ms = (time.perf_counter_ns() - speed_assembly_started_ns) / 1e6
+        speed_pre_generation_ms = (time.perf_counter() - speed_request_started) * 1000
+        generation_request = GenerateReqInput(
+            rid=base_rid,
+            input_ids=list(plan.logical_input_ids),
+            sampling_params=sampling_params,
+            return_logprob=True,
+            logprob_start_len=-1,
+            top_logprobs_num=0,
+            token_ids_logprob=None,
+            stream=False,
+            return_hidden_states=shadow_enabled,
+            c2kv_prompt_last_hidden_only=shadow_enabled,
+            c2kv_segments=segments,
+            c2kv_kv_memory_hint={},
+            # The selected C1000 checkpoint contract uses ordinary/base query
+            # projections after injected gist KV.
+            c2kv_use_gist_projection=False,
+            c2kv_outer_request_id=outer_request_id,
+            c2kv_measurement_phase=generation_phase,
+            c2kv_paper_whole_full_kv_tokens=paper_whole_full,
+            c2kv_paper_whole_full_source=paper_whole_full_source,
+            c2kv_paper_history_full_kv_tokens=history_source_tokens,
+            c2kv_paper_history_active_kv_tokens=history_gist_tokens,
+            c2kv_paper_canonical_full_source=True,
+        )
+        generated = await tokenizer_manager.generate_request(
+            generation_request, raw_request
+        ).__anext__()
+        meta_info = generated.get("meta_info") or {}
+        speed_timing = dict(meta_info.get("speed_timing") or {})
+        if speed_timing:
+            speed_timing.update(
+                native_pre_generation_ms=speed_pre_generation_ms,
+                native_plan_ms=native_plan_ms,
+                cache_hit_lookup_load_ms=cache_hit_lookup_load_ms,
+                cache_miss_extraction_ms=cache_miss_extraction_ms,
+                native_request_assembly_ms=native_request_assembly_ms,
+                kv_injection_host_ms=(
+                    float((meta_info.get("kv_runtime_stats") or {}).get("c2kv_injection_duration_ns") or 0) / 1e6
+                ),
+                native_ttft_ms=speed_pre_generation_ms + speed_timing["server_ttft_ms"],
+                native_request_ms=(time.perf_counter() - speed_request_started) * 1000,
+            )
+        output_ids = list(generated.get("output_ids") or [])
+        raw_logprobs = list(meta_info.get("output_token_logprobs") or [])
+        token_logprobs = [
+            None if row is None else float(row[0]) for row in raw_logprobs
+        ]
+        if len(token_logprobs) != len(output_ids):
+            raise ValueError(
+                "C2KV native generation returned misaligned token logprobs: "
+                f"{len(token_logprobs)} != {len(output_ids)}"
+            )
+
+        shadow_features = None
+        if shadow_enabled:
+            hidden_steps = meta_info.get("hidden_states") or []
+            if not hidden_steps:
+                raise ValueError(
+                    "C2KV native generation did not return the configured shadow feature"
+                )
+            prefill_state = hidden_steps[0]
+            if prefill_state and isinstance(prefill_state[0], list):
+                prefill_state = prefill_state[-1]
+            if not isinstance(prefill_state, list) or not prefill_state:
+                raise ValueError("C2KV native prompt_last hidden state is malformed")
+            logical_position = plan.costs.get("canonical_position_tokens", (
+                len(request.system_input_ids)
+                + sum(len(chunk.token_ids) for chunk in request.encoder_chunks)
+                + len(request.workspace_input_ids)
+            )) - 1
+            shadow_features = {
+                "schema": "event-native-shadow-features-v1",
+                "status": "captured",
+                "bindings": {
+                    "model": capability["model_binding"],
+                    "layer_indexing": "zero_based_decoder_layer_output",
+                },
+                "prefill": {
+                    "status": "captured",
+                    "reason": None,
+                    "layer": normalized_shadow_layer,
+                    "position": {
+                        "kind": "prompt_last",
+                        "logical_position": logical_position,
+                    },
+                    "readout": "decoder_layer_output",
+                    "stored_dtype": "float16",
+                    "hidden": float16_roundtrip(prefill_state),
+                },
+                "memgen": {
+                    "status": "disabled",
+                    "layer": None,
+                    "hidden": None,
+                },
+                "capture_errors": [],
+            }
+
+        kv_bytes_per_token = capability["kv_bytes_per_token"]
+        costs = dict(plan.costs)
+        costs.update(
+            {
+                "materialized_encoder_tokens": materialized_encoder_tokens,
+                "scope_reused_encoder_tokens": scope_reused_encoder_tokens,
+                "system_prefix_kv_logical_bytes": (
+                    costs.get("system_prefix_kv_tokens", costs["system_tokens"]) * kv_bytes_per_token
+                ),
+                "gist_prefix_kv_logical_bytes": (
+                    costs["gist_prefix_kv_tokens"] * kv_bytes_per_token
+                ),
+                "raw_workspace_kv_logical_bytes": (
+                    costs.get("workspace_resident_kv_tokens", costs["raw_workspace_kv_tokens"]) * kv_bytes_per_token
+                ),
+                "resident_kv_logical_bytes": (
+                    costs["resident_kv_tokens"] * kv_bytes_per_token
+                ),
+                "kv_bytes_per_token": kv_bytes_per_token,
+            }
+        )
+        finish_reason_detail = meta_info.get("finish_reason")
+        finish_reason = (
+            finish_reason_detail.get("type")
+            if isinstance(finish_reason_detail, dict)
+            else finish_reason_detail
+        )
+        kv_runtime_stats = meta_info.get("kv_runtime_stats")
+        generation_paper_measurement = (
+            kv_runtime_stats.get("paper_measurement")
+            if isinstance(kv_runtime_stats, dict)
+            else None
+        )
+
+        return orjson_response(
+            {
+                "schema": NATIVE_PACKED_RESPONSE_SCHEMA,
+                "rid": base_rid,
+                "native_request_id": base_rid,
+                "outer_request_id": outer_request_id,
+                "request_ids": {
+                    "outer_request_id": outer_request_id,
+                    "native_generation_request_id": base_rid,
+                    "native_extraction_request_ids": [
+                        item["server_request_id"] for item in extraction_telemetry
+                    ],
+                },
+                "session_id": request.session_id,
+                "generation_id": request.generation_id,
+                "sampling_profile": request.sampling_profile,
+                "output_ids": output_ids,
+                "text": generated.get("text", ""),
+                "token_logprobs": token_logprobs,
+                "finish_reason": finish_reason,
+                "finish_reason_detail": finish_reason_detail,
+                "encoder_chunks": [
+                    resolved[handle] for handle in plan.selected_handles
+                ],
+                "compression_chunks": [
+                    resolved[handle] for handle in plan.compression_handles
+                ],
+                "extraction": {
+                    "requested_chunks": len(request.encoder_chunks)
+                    + len(request.compression_chunks)
+                    + sum(len(item.chunks) if item.chunks else 1 for item in request.tool_gist_segments),
+                    "unique_chunks": len(plan.unique_chunks),
+                    "cache_hits": cache_hits,
+                    "cache_misses": cache_misses,
+                    "model_calls": cache_misses,
+                    "max_extraction_calls": request.max_extraction_calls,
+                    **({"history_model_calls": projection_misses["history"],
+                        "tool_model_calls": projection_misses["tool"],
+                        "max_tool_extraction_calls": request.max_tool_extraction_calls}
+                       if request.max_tool_extraction_calls is not None else {}),
+                },
+                "costs": costs,
+                "shadow_features": shadow_features,
+                "allocator": meta_info.get("kv_memory_report"),
+                "sglang_runtime": kv_runtime_stats,
+                "paper_measurement": generation_paper_measurement,
+                "speed_timing": speed_timing,
+                "telemetry": {
+                    "outer_request_id": outer_request_id,
+                    "extractions": extraction_telemetry,
+                    "generation": {
+                        "outer_request_id": outer_request_id,
+                        "server_request_id": base_rid,
+                        "phase": generation_phase,
+                        "paper_measurement": generation_paper_measurement,
+                    },
+                },
+            }
+        )
+    except ValueError as error:
+        logger.error("[c2kv-native] request rejected: %s", error)
+        return _create_error_response(error)
+
+
+@app.api_route("/encode", methods=["POST", "PUT"])
+async def encode_request(obj: EmbeddingReqInput, request: Request):
+    """Handle an embedding request."""
+    try:
+        ret = await _global_state.tokenizer_manager.generate_request(
+            obj, request
+        ).__anext__()
+        return ret
+    except ValueError as e:
+        return _create_error_response(e)
+
+
+@app.api_route("/classify", methods=["POST", "PUT"])
+async def classify_request(obj: EmbeddingReqInput, request: Request):
+    """Handle a reward model request. Now the arguments and return values are the same as embedding models."""
+    try:
+        ret = await _global_state.tokenizer_manager.generate_request(
+            obj, request
+        ).__anext__()
+        return ret
+    except ValueError as e:
+        return _create_error_response(e)
+
+
+@app.api_route("/flush_cache", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
+    """Flush the radix cache."""
+    ret = await _global_state.tokenizer_manager.flush_cache(timeout_s=timeout)
+    if ret.success:
+        content = (
+            "Cache flushed.\nPlease check backend logs for more details. "
+            "(When there are running or waiting requests, the operation will not be performed.)\n"
+        )
+    else:
+        content = ret.message or "Flush cache failed.\n"
+    return Response(
+        content=content,
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.api_route("/clear_hicache_storage_backend", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def clear_hicache_storage_backend_deprecated():
+    """Deprecated: use POST /hicache/storage-backend/clear."""
+    ret = await _global_state.tokenizer_manager.clear_hicache_storage()
+    return Response(
+        content=(
+            "Deprecated endpoint. Use POST /hicache/storage-backend/clear.\n"
+            "Hierarchical cache storage backend cleared.\n"
+        ),
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+# example usage:
+# curl -s -X POST http://127.0.0.1:30000/clear_hicache_storage_backend
+@app.api_route("/hicache/storage-backend/clear", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def clear_hicache_storage_backend():
+    """Clear the hierarchical cache storage backend."""
+    ret = await _global_state.tokenizer_manager.clear_hicache_storage()
+    return Response(
+        content="Hierarchical cache storage backend cleared.\n",
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+# example usage:
+# curl -s -X PUT http://127.0.0.1:30000/hicache/storage-backend \
+#  -H 'Content-Type: application/json' \
+#   -d '{
+#     "hicache_storage_backend": "file",
+#     "hicache_storage_backend_extra_config_json": "{}",
+#     "hicache_storage_prefetch_policy": "timeout",
+#     "hicache_write_policy": "write_through"
+#   }'
+@app.api_route("/hicache/storage-backend", methods=["PUT"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def attach_hicache_storage_backend(obj: AttachHiCacheStorageReqInput):
+    """Attach (enable) HiCache storage backend at runtime.
+
+    Only allowed when there are NO running / queued requests.
+    """
+    if not _global_state.tokenizer_manager.server_args.admin_api_key:
+        return _admin_api_key_missing_response()
+
+    ret = await _global_state.tokenizer_manager.attach_hicache_storage(
+        hicache_storage_backend=obj.hicache_storage_backend,
+        hicache_storage_backend_extra_config_json=obj.hicache_storage_backend_extra_config_json,
+        hicache_storage_prefetch_policy=obj.hicache_storage_prefetch_policy,
+        hicache_write_policy=obj.hicache_write_policy,
+    )
+    msg = getattr(ret, "message", "")
+    return Response(
+        content=(
+            (
+                "HiCache storage backend attached.\n"
+                if ret.success
+                else "Failed to attach HiCache storage backend.\n"
+            )
+            + (msg + "\n" if msg else "")
+        ),
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+# example usage:
+# curl -s -X DELETE http://127.0.0.1:30000/hicache/storage-backend
+@app.api_route("/hicache/storage-backend", methods=["DELETE"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def detach_hicache_storage_backend():
+    """Detach (disable) HiCache storage backend at runtime.
+
+    Only allowed when there are NO running / queued requests.
+    """
+    if not _global_state.tokenizer_manager.server_args.admin_api_key:
+        return _admin_api_key_missing_response()
+
+    ret = await _global_state.tokenizer_manager.detach_hicache_storage()
+    msg = getattr(ret, "message", "")
+    return Response(
+        content=(
+            (
+                "HiCache storage backend detached.\n"
+                if ret.success
+                else "Failed to detach HiCache storage backend.\n"
+            )
+            + (msg + "\n" if msg else "")
+        ),
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+# example usage:
+# curl -s http://127.0.0.1:30000/hicache/storage-backend
+@app.get("/hicache/storage-backend")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def hicache_storage_backend_status():
+    """Get current HiCache storage backend status (tokenizer-side view)."""
+    if not _global_state.tokenizer_manager.server_args.admin_api_key:
+        return _admin_api_key_missing_response()
+
+    return {
+        "hicache_storage_backend": _global_state.tokenizer_manager.server_args.hicache_storage_backend,
+        "hicache_storage_backend_extra_config": _global_state.tokenizer_manager.server_args.hicache_storage_backend_extra_config,
+        "hicache_storage_prefetch_policy": _global_state.tokenizer_manager.server_args.hicache_storage_prefetch_policy,
+        "hicache_write_policy": _global_state.tokenizer_manager.server_args.hicache_write_policy,
+    }
+
+
+@app.post("/recovery_checkpoint/create")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def create_recovery_checkpoint(obj: CreateRecoveryCheckpointReqInput):
+    """Register an already-prefilled Full-KV prefix as a host recovery checkpoint."""
+    ret = await _global_state.tokenizer_manager.create_recovery_checkpoint(obj)
+    return ORJSONResponse(
+        content=dataclasses.asdict(ret),
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.post("/recovery_checkpoint/restore")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def restore_recovery_checkpoint(obj: RestoreRecoveryCheckpointReqInput):
+    """Load a host recovery checkpoint back to device KV cache."""
+    ret = await _global_state.tokenizer_manager.restore_recovery_checkpoint(obj)
+    return ORJSONResponse(
+        content=dataclasses.asdict(ret),
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.post("/recovery_checkpoint/release")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def release_recovery_checkpoint(obj: ReleaseRecoveryCheckpointReqInput):
+    """Release host/device pins for a recovery checkpoint."""
+    ret = await _global_state.tokenizer_manager.release_recovery_checkpoint(obj)
+    return ORJSONResponse(
+        content=dataclasses.asdict(ret),
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.api_route("/recovery_checkpoint/status", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def recovery_checkpoint_status(
+    obj: Optional[GetRecoveryCheckpointReqInput] = None,
+    checkpoint_id: Optional[str] = Query(None),
+):
+    """Return recovery checkpoint status without exposing TreeNode or tensors."""
+    if obj is None:
+        obj = GetRecoveryCheckpointReqInput(checkpoint_id=checkpoint_id)
+    elif obj.checkpoint_id is None and checkpoint_id is not None:
+        obj.checkpoint_id = checkpoint_id
+    ret = await _global_state.tokenizer_manager.get_recovery_checkpoint(obj)
+    return ORJSONResponse(
+        content=dataclasses.asdict(ret),
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.api_route("/start_profile", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def start_profile_async(obj: Optional[ProfileReqInput] = None):
+    """Start profiling."""
+    if obj is None:
+        obj = ProfileReqInput()
+
+    await _global_state.tokenizer_manager.start_profile(
+        output_dir=obj.output_dir,
+        start_step=obj.start_step,
+        num_steps=obj.num_steps,
+        activities=obj.activities,
+        with_stack=obj.with_stack,
+        record_shapes=obj.record_shapes,
+        profile_by_stage=obj.profile_by_stage,
+        merge_profiles=obj.merge_profiles,
+        profile_prefix=obj.profile_prefix,
+        profile_stages=obj.profile_stages,
+    )
+    return Response(
+        content="Start profiling.\n",
+        status_code=200,
+    )
+
+
+@app.api_route("/stop_profile", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def stop_profile_async():
+    """Stop profiling."""
+    await _global_state.tokenizer_manager.stop_profile()
+    return Response(
+        content="Stop profiling. This will take some time.\n",
+        status_code=200,
+    )
+
+
+@app.api_route("/set_trace_level", methods=["GET", "POST"])
+def set_trace_level(level: int = Query(..., ge=0)):
+    set_global_trace_level(level)
+
+    return Response(
+        content="success",
+        status_code=200,
+    )
+
+
+@app.api_route("/freeze_gc", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def freeze_gc_async():
+    """
+    See engine.freeze_gc for more details.
+    """
+    await _global_state.tokenizer_manager.freeze_gc()
+    return Response(
+        content="Garbage collection frozen.\n",
+        status_code=200,
+    )
+
+
+@app.api_route("/start_expert_distribution_record", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def start_expert_distribution_record_async():
+    """Start recording the expert distribution. Clear the previous record if any."""
+    await _global_state.tokenizer_manager.start_expert_distribution_record()
+    return Response(
+        content="Start recording the expert distribution.\n",
+        status_code=200,
+    )
+
+
+@app.api_route("/stop_expert_distribution_record", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def stop_expert_distribution_record_async():
+    """Stop recording the expert distribution."""
+    await _global_state.tokenizer_manager.stop_expert_distribution_record()
+    return Response(
+        content="Stop recording the expert distribution.\n",
+        status_code=200,
+    )
+
+
+@app.api_route("/dump_expert_distribution_record", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def dump_expert_distribution_record_async():
+    """Dump expert distribution record."""
+    await _global_state.tokenizer_manager.dump_expert_distribution_record()
+    return Response(
+        content="Dump expert distribution record.\n",
+        status_code=200,
+    )
+
+
+@app.post("/update_weights_from_disk")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: Request):
+    """Update the weights from disk inplace without re-launching the server."""
+    success, message, num_paused_requests = (
+        await _global_state.tokenizer_manager.update_weights_from_disk(obj, request)
+    )
+
+    content = {
+        "success": success,
+        "message": message,
+        "num_paused_requests": num_paused_requests,
+    }
+    if success:
+        return ORJSONResponse(
+            content,
+            status_code=HTTPStatus.OK,
+        )
+    else:
+        return ORJSONResponse(
+            content,
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+
+@app.post("/init_weights_send_group_for_remote_instance")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def init_weights_send_group_for_remote_instance(
+    obj: InitWeightsSendGroupForRemoteInstanceReqInput, request: Request
+):
+    success, message = (
+        await _global_state.tokenizer_manager.init_weights_send_group_for_remote_instance(
+            obj, request
+        )
+    )
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/send_weights_to_remote_instance")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def send_weights_to_remote_instance(
+    obj: SendWeightsToRemoteInstanceReqInput, request: Request
+):
+    success, message = (
+        await _global_state.tokenizer_manager.send_weights_to_remote_instance(
+            obj, request
+        )
+    )
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.get("/get_remote_instance_transfer_engine_info")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def get_remote_instance_transfer_engine_info(rank: int = None):
+    """Get the server information (deprecated - use /remote_instance_transfer_engine_info instead)."""
+    logger.warning(
+        "Endpoint '/get_remote_instance_transfer_engine_info' is deprecated and will be removed in a future version. "
+        "Please use '/remote_instance_transfer_engine_info' instead."
+    )
+    return await remote_instance_transfer_engine_info(rank=rank)
+
+
+@app.get("/remote_instance_transfer_engine_info")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def remote_instance_transfer_engine_info(rank: int = None):
+    if rank is None or rank < 0:
+        return ORJSONResponse(
+            {"error": {"message": "Missing or invalid rank parameter"}},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+    server_args = _global_state.tokenizer_manager.server_args
+    try:
+        resp = requests.get(
+            f"{server_args.engine_info_bootstrap_url}/get_transfer_engine_info",
+            params={"rank": rank},
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+    except (requests.exceptions.RequestException, ValueError) as e:
+        logger.warning(f"Failed to get transfer engine info for rank {rank}: {e}")
+
+    return ORJSONResponse(
+        {"error": {"message": f"Failed to get transfer engine info for rank {rank}"}},
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.post("/init_weights_update_group")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def init_weights_update_group(
+    obj: InitWeightsUpdateGroupReqInput, request: Request
+):
+    """Initialize the parameter update group."""
+    success, message = await _global_state.tokenizer_manager.init_weights_update_group(
+        obj, request
+    )
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/destroy_weights_update_group")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def destroy_weights_update_group(
+    obj: DestroyWeightsUpdateGroupReqInput, request: Request
+):
+    """Destroy the parameter update group."""
+    success, message = (
+        await _global_state.tokenizer_manager.destroy_weights_update_group(obj, request)
+    )
+    content = {"success": success, "message": message}
+    return ORJSONResponse(
+        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+    )
+
+
+@app.post("/update_weights_from_tensor")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def update_weights_from_tensor(
+    obj: UpdateWeightsFromTensorReqInput, request: Request
+):
+    """Update the weights from tensor inplace without re-launching the server.
+    Notes:
+    1. Ensure that the model is on the correct device (e.g., GPU) before calling this endpoint. If the model is moved to the CPU unexpectedly, it may cause performance issues or runtime errors.
+    2. HTTP will transmit only the metadata of the tensor, while the tensor itself will be directly copied to the model.
+    3. Any binary data in the named tensors should be base64 encoded.
+    """
+
+    success, message = await _global_state.tokenizer_manager.update_weights_from_tensor(
+        obj, request
+    )
+
+    content = {"success": success, "message": message}
+    return ORJSONResponse(
+        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+    )
+
+
+@app.post("/update_weights_from_distributed")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def update_weights_from_distributed(
+    obj: UpdateWeightsFromDistributedReqInput, request: Request
+):
+    """Update model parameter from distributed online."""
+    success, message = (
+        await _global_state.tokenizer_manager.update_weights_from_distributed(
+            obj, request
+        )
+    )
+
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/update_weights_from_ipc")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def update_weights_from_ipc(obj: UpdateWeightsFromIPCReqInput, request: Request):
+    """Update the weights from IPC (Inter-Process Communication) for checkpoint-engine integration."""
+    success, message = await _global_state.tokenizer_manager.update_weights_from_ipc(
+        obj, request
+    )
+
+    content = {"success": success, "message": message}
+    if success:
+        if _global_state.tokenizer_manager.initial_weights_loaded is False:
+            _global_state.tokenizer_manager.initial_weights_loaded = True
+        return ORJSONResponse(content)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/update_weight_version")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def update_weight_version(obj: UpdateWeightVersionReqInput, request: Request):
+    """Update the weight version. This operation requires no active requests."""
+    if obj.abort_all_requests:
+        _global_state.tokenizer_manager.abort_request(abort_all=True)
+
+    # Use a simple approach without the complex lock mechanism for now
+    # since weight_version update is a simple operation that doesn't affect model weights
+    try:
+        # Update the weight version in server args (the single source of truth)
+        _global_state.tokenizer_manager.server_args.weight_version = obj.new_version
+
+        return ORJSONResponse(
+            {
+                "success": True,
+                "message": f"Weight version updated to {obj.new_version}",
+                "new_version": obj.new_version,
+            },
+            status_code=HTTPStatus.OK,
+        )
+    except Exception as e:
+        return ORJSONResponse(
+            {
+                "success": False,
+                "message": f"Failed to update weight version: {str(e)}",
+            },
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+
+@app.api_route("/get_weights_by_name", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
+    """Get model parameter by name."""
+    try:
+        ret = await _global_state.tokenizer_manager.get_weights_by_name(obj, request)
+        if ret is None:
+            return _create_error_response("Get parameter by name failed")
+        else:
+            return ORJSONResponse(ret, status_code=200)
+    except Exception as e:
+        return _create_error_response(e)
+
+
+@app.api_route("/release_memory_occupation", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def release_memory_occupation(
+    obj: ReleaseMemoryOccupationReqInput, request: Request
+):
+    """Release GPU memory occupation temporarily."""
+    try:
+        await _global_state.tokenizer_manager.release_memory_occupation(obj, request)
+    except Exception as e:
+        return _create_error_response(e)
+
+
+@app.api_route("/resume_memory_occupation", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def resume_memory_occupation(
+    obj: ResumeMemoryOccupationReqInput, request: Request
+):
+    """Resume GPU memory occupation."""
+    try:
+        await _global_state.tokenizer_manager.resume_memory_occupation(obj, request)
+    except Exception as e:
+        return _create_error_response(e)
+
+
+@app.post("/weights_checker")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def check_weights(obj: CheckWeightsReqInput, request: Request):
+    success, message = await _global_state.tokenizer_manager.check_weights(obj, request)
+    return ORJSONResponse(
+        {"success": success, "message": message},
+        status_code=200 if success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.api_route("/slow_down", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def slow_down(obj: SlowDownReqInput, request: Request):
+    """Slow down the system deliberately. Only for testing. Example scenario:
+    when we want to test performance of D in large-scale PD disaggregation and have no enough nodes for P,
+    we can use this to slow down D to let it have enough running sequences, and then disable slowdown
+    to let it run in full batch size.
+    """
+    try:
+        await _global_state.tokenizer_manager.slow_down(obj, request)
+    except Exception as e:
+        return _create_error_response(e)
+
+
+@app.api_route("/load_lora_adapter", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def load_lora_adapter(obj: LoadLoRAAdapterReqInput, request: Request):
+    """Load a new LoRA adapter without re-launching the server."""
+    result = await _global_state.tokenizer_manager.load_lora_adapter(obj, request)
+
+    if result.success:
+        return ORJSONResponse(
+            result,
+            status_code=HTTPStatus.OK,
+        )
+    else:
+        return ORJSONResponse(
+            result,
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+
+@app.api_route("/load_lora_adapter_from_tensors", methods=["POST"])
+async def load_lora_adapter_from_tensors(
+    obj: LoadLoRAAdapterFromTensorsReqInput, request: Request
+):
+    """Load a new LoRA adapter from tensors without re-launching the server."""
+    result = await _global_state.tokenizer_manager.load_lora_adapter_from_tensors(
+        obj, request
+    )
+
+    if result.success:
+        return ORJSONResponse(result, status_code=HTTPStatus.OK)
+    else:
+        return ORJSONResponse(result, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.api_route("/unload_lora_adapter", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def unload_lora_adapter(obj: UnloadLoRAAdapterReqInput, request: Request):
+    """Load a new LoRA adapter without re-launching the server."""
+    result = await _global_state.tokenizer_manager.unload_lora_adapter(obj, request)
+
+    if result.success:
+        return ORJSONResponse(
+            result,
+            status_code=HTTPStatus.OK,
+        )
+    else:
+        return ORJSONResponse(
+            result,
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+
+@app.api_route("/open_session", methods=["GET", "POST"])
+async def open_session(obj: OpenSessionReqInput, request: Request):
+    """Open a session, and return its unique session id."""
+    try:
+        session_id = await _global_state.tokenizer_manager.open_session(obj, request)
+        if session_id is None:
+            raise Exception(
+                "Failed to open the session. Check if a session with the same id is still open."
+            )
+        return session_id
+    except Exception as e:
+        return _create_error_response(e)
+
+
+@app.api_route("/close_session", methods=["GET", "POST"])
+async def close_session(obj: CloseSessionReqInput, request: Request):
+    """Close the session."""
+    try:
+        await _global_state.tokenizer_manager.close_session(obj, request)
+        serving_chat = getattr(request.app.state, "openai_serving_chat", None)
+        if serving_chat is not None:
+            serving_chat.release_persistent_history_session(obj.session_id)
+        return Response(status_code=200)
+    except Exception as e:
+        return _create_error_response(e)
+
+
+@app.api_route("/configure_logging", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def configure_logging(obj: ConfigureLoggingReq, request: Request):
+    """Configure the request logging options."""
+    _global_state.tokenizer_manager.configure_logging(obj)
+    return Response(status_code=200)
+
+
+@app.post("/abort_request")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def abort_request(obj: AbortReq, request: Request):
+    """Abort a request."""
+    try:
+        _global_state.tokenizer_manager.abort_request(
+            rid=obj.rid, abort_all=obj.abort_all
+        )
+        return Response(status_code=200)
+    except Exception as e:
+        return _create_error_response(e)
+
+
+@app.post("/parse_function_call")
+async def parse_function_call_request(obj: ParseFunctionCallReq, request: Request):
+    """
+    A native API endpoint to parse function calls from a text.
+    """
+    # 1) Initialize the parser based on the request body
+    parser = FunctionCallParser(tools=obj.tools, tool_call_parser=obj.tool_call_parser)
+
+    # 2) Call the non-stream parsing method (non-stream)
+    normal_text, calls = parser.parse_non_stream(obj.text)
+
+    # 3) Organize the response content
+    response_data = {
+        "normal_text": normal_text,
+        "calls": [
+            call.model_dump() for call in calls
+        ],  # Convert pydantic objects to dictionaries
+    }
+
+    return ORJSONResponse(content=response_data, status_code=200)
+
+
+@app.post("/separate_reasoning")
+async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Request):
+    """
+    A native API endpoint to separate reasoning from a text.
+    """
+    # 1) Initialize the parser based on the request body
+    parser = ReasoningParser(model_type=obj.reasoning_parser, request=request)
+
+    # 2) Call the non-stream parsing method (non-stream)
+    reasoning_text, normal_text = parser.parse_non_stream(obj.text)
+
+    # 3) Organize the response content
+    response_data = {
+        "reasoning_text": reasoning_text,
+        "text": normal_text,
+    }
+
+    return ORJSONResponse(content=response_data, status_code=200)
+
+
+@app.post("/pause_generation")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def pause_generation(obj: PauseGenerationReqInput, request: Request):
+    """Pause generation."""
+    await _global_state.tokenizer_manager.pause_generation(obj)
+    return ORJSONResponse(
+        content={"message": "Generation paused successfully.", "status": "ok"},
+        status_code=200,
+    )
+
+
+@app.post("/continue_generation")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def continue_generation(obj: ContinueGenerationReqInput, request: Request):
+    """Continue generation."""
+    await _global_state.tokenizer_manager.continue_generation(obj)
+    return ORJSONResponse(
+        content={"message": "Generation continued successfully.", "status": "ok"},
+        status_code=200,
+    )
+
+
+##### OpenAI-compatible API endpoints #####
+
+
+@app.post("/v1/completions", dependencies=[Depends(validate_json_request)])
+async def openai_v1_completions(request: CompletionRequest, raw_request: Request):
+    """OpenAI-compatible text completion endpoint."""
+    return await raw_request.app.state.openai_serving_completion.handle_request(
+        request, raw_request
+    )
+
+
+@app.post("/v1/chat/completions", dependencies=[Depends(validate_json_request)])
+async def openai_v1_chat_completions(
+    request: ChatCompletionRequest, raw_request: Request
+):
+    """OpenAI-compatible chat completion endpoint."""
+    return await raw_request.app.state.openai_serving_chat.handle_request(
+        request, raw_request
+    )
+
+
+def _c2kv_flat_tools(tools):
+    """Serialize tool schemas for a chat template exactly as the serving path
+    does (`OpenAIServingChat._chat_template_tools`), under the same
+    `--c2kv-tools-dump` server flag.
+
+    Every C2KV endpoint that renders a prompt must go through here. If the tool
+    prologue of /v1/c2kv/extract, /v1/c2kv/repair_extract and
+    /v1/chat/completions disagree, `original_seq_len` and the repair span are
+    measured in a token frame the served prompt does not have (+4 tokens per
+    tool with the Qwen3 template under the "full" default, because plain
+    `model_dump()` adds `"strict": false`). See
+    c2kv/c2kv_serving_semantics.md."""
+    if not tools:
+        return None
+    from sglang.srt.entrypoints.openai.protocol import Tool, chat_template_tools_dump
+
+    server_args = getattr(
+        getattr(_global_state, "tokenizer_manager", None), "server_args", None
+    )
+    exclude_unset = (
+        getattr(server_args, "c2kv_tools_dump", "full") == "exclude_unset"
+    )
+    return chat_template_tools_dump(
+        [Tool.model_validate(item) if isinstance(item, dict) else item for item in tools],
+        exclude_unset=exclude_unset,
+    )
+
+
+@app.post("/v1/c2kv/extract")
+async def v1_c2kv_extract(
+    request: C2KVExtractRequest, raw_request: Request
+) -> C2KVExtractResponse:
+    """Extract and store C2KV gist KV cache for a document."""
+    try:
+        tokenizer_manager = _global_state.tokenizer_manager
+        tokenizer = tokenizer_manager.tokenizer
+        if request.projection_set not in ("history", "tool"):
+            raise ValueError(
+                f"projection_set must be 'history' or 'tool', got {request.projection_set!r}"
+            )
+        if request.token_ids is not None:
+            # Exact encoder input: the caller owns tokenization and chunking.
+            input_ids = [int(token_id) for token_id in request.token_ids]
+            if not input_ids or any(token_id < 0 for token_id in input_ids):
+                return C2KVExtractResponse(
+                    key_hash="",
+                    gist_len=0,
+                    original_seq_len=0,
+                    success=False,
+                    error="token_ids must be a non-empty list of token ids",
+                )
+        elif request.role:
+            input_ids = _c2kv_template_ids(
+                tokenizer,
+                [{"role": request.role, "content": request.text}],
+                request.tools,
+                request.chat_template_kwargs,
+            )
+            if not input_ids:
+                return C2KVExtractResponse(
+                    key_hash="",
+                    gist_len=0,
+                    original_seq_len=0,
+                    success=False,
+                    error="The message contributes no tokens after applying "
+                          "the chat template. Please check if the chat template "
+                          "is correct and compatible with the input messages.",
+                )
+        else:
+            input_ids = tokenizer.encode(request.text)
+            if not isinstance(input_ids, list):
+                input_ids = list(input_ids)
+
+        result = await tokenizer_manager.c2kv_extract(
+            input_ids=input_ids,
+            input_text=request.text,
+            compression_ratio=request.compression_ratio,
+            outer_request_id=raw_request.headers.get(
+                "X-C2KV-Measurement-Request-Id"
+            ),
+            measurement_phase=raw_request.headers.get("X-C2KV-Measurement-Phase"),
+            projection_set=request.projection_set,
+        )
+        return C2KVExtractResponse(
+            key_hash=result.key_hash,
+            gist_len=result.gist_len,
+            original_seq_len=result.original_seq_len,
+            cache_hit=result.cache_hit,
+            extraction_duration_ns=result.extraction_duration_ns,
+            gist_generation_duration_ns=result.gist_generation_duration_ns,
+            success=result.success,
+            error=result.error or None,
+            paper_measurement=result.paper_measurement,
+        )
+    except Exception as e:
+        return C2KVExtractResponse(
+            key_hash="", gist_len=0, original_seq_len=0,
+            success=False, error=str(e),
+        )
+
+
+def _c2kv_template_ids(tokenizer, messages, tools, chat_template_kwargs):
+    """Token ids of `messages` rendered like a chat request (no generation
+    prompt, BOS stripped), with `tools` serialized exactly as serving_chat does
+    (chat_template_tools_dump under the same --c2kv-tools-dump mode) so the tool
+    prologue matches the serving prompt."""
+    flat_tools = _c2kv_flat_tools(tools)
+    text_str = tokenizer.apply_chat_template(
+        list(messages),
+        tokenize=False,
+        add_generation_prompt=False,
+        tools=flat_tools,
+        **(chat_template_kwargs or {}),
+    )
+    if tokenizer.bos_token and text_str.startswith(tokenizer.bos_token):
+        text_str = text_str[len(tokenizer.bos_token):]
+    ids = tokenizer.encode(text_str, add_special_tokens=False)
+    return list(ids)
+
+
+@app.post("/v1/c2kv/tokenize")
+async def v1_c2kv_tokenize(
+    request: C2KVTokenizeRequest,
+) -> C2KVTokenizeResponse:
+    """Count the exact extractor input tokens without scheduling model work."""
+    try:
+        tokenizer = _global_state.tokenizer_manager.tokenizer
+        if request.role:
+            input_ids = _c2kv_template_ids(
+                tokenizer,
+                [{"role": request.role, "content": request.text}],
+                request.tools,
+                request.chat_template_kwargs,
+            )
+        else:
+            input_ids = tokenizer.encode(request.text)
+            if not isinstance(input_ids, list):
+                input_ids = list(input_ids)
+        if not input_ids:
+            return C2KVTokenizeResponse(
+                token_count=0,
+                success=False,
+                error="The message contributes no tokens after applying the chat template.",
+            )
+        return C2KVTokenizeResponse(token_count=len(input_ids))
+    except Exception as e:
+        return C2KVTokenizeResponse(token_count=0, success=False, error=str(e))
+
+
+def _render_c2kv_repair_span(tokenizer, messages, target_index, tools, chat_template_kwargs):
+    """Render messages[:target_index+1] and locate message `target_index`.
+
+    Returns (input_ids, span_start, span_end, rendered_prefix_len). The prefix
+    rendering must be prefix-stable (the full rendering starts with the
+    prefix rendering token for token); otherwise the span cannot be trusted
+    and a ValueError is raised. For target_index == 0 the prologue (system
+    message / tool schemas rendered before the first message) is located by
+    rendering the message with and without tools, mirroring
+    serving_chat._c2kv_first_message_start_offset.
+    """
+    if target_index is None:
+        raise ValueError("target_index is required with messages")
+    messages = [dict(m) for m in messages]
+    if not (0 <= target_index < len(messages)):
+        raise ValueError(
+            f"target_index {target_index} out of range for {len(messages)} messages"
+        )
+    full_ids = _c2kv_template_ids(
+        tokenizer, messages[: target_index + 1], tools, chat_template_kwargs
+    )
+    if target_index > 0:
+        prefix_ids = _c2kv_template_ids(
+            tokenizer, messages[:target_index], tools, chat_template_kwargs
+        )
+        if full_ids[: len(prefix_ids)] != prefix_ids:
+            raise ValueError(
+                "chat template rendering is not prefix-stable at message "
+                f"{target_index}; refusing to build a repair span"
+            )
+        span_start = len(prefix_ids)
+    else:
+        without = _c2kv_template_ids(tokenizer, messages[:1], None, chat_template_kwargs)
+        span_start = 0
+        if tools and without:
+            limit = len(full_ids) - len(without) + 1
+            found = -1
+            for start in range(max(0, limit)):
+                if full_ids[start : start + len(without)] == without:
+                    found = start
+                    break
+            if found < 0 and full_ids[-len(without) :] == without:
+                found = len(full_ids) - len(without)
+            if found < 0:
+                raise ValueError(
+                    "could not locate the first message inside the tool prologue"
+                )
+            span_start = found
+    span_end = len(full_ids)
+    if span_end <= span_start:
+        raise ValueError("target message contributes no tokens")
+    return full_ids, span_start, span_end, span_start
+
+
+def _render_c2kv_repair_span_range(
+    tokenizer, messages, target_index, target_end_index, tools, chat_template_kwargs
+):
+    """Multi-message span: messages[target_index .. target_end_index] inside the
+    rendering of messages[:target_end_index+1], with the token boundary of
+    every message in the range (one CacheBlend chunk each).
+
+    Returns (input_ids, span_start, span_end, rendered_prefix_len, chunk_bounds)
+    where chunk_bounds are RELATIVE to span_start.  Each boundary is the
+    length of the prefix rendering messages[:i+1], checked prefix-stable
+    against the next one exactly as _render_c2kv_repair_span does.
+    """
+    if target_end_index is None:
+        raise ValueError("target_end_index is required for a multi-message span")
+    messages = [dict(m) for m in messages]
+    if not (0 <= target_index <= target_end_index < len(messages)):
+        raise ValueError(
+            f"target range [{target_index}, {target_end_index}] out of range for "
+            f"{len(messages)} messages"
+        )
+    _, span_start, first_end, rendered_prefix_len = _render_c2kv_repair_span(
+        tokenizer, messages, target_index, tools, chat_template_kwargs
+    )
+    ends = [first_end]
+    prev_ids = _c2kv_template_ids(
+        tokenizer, messages[: target_index + 1], tools, chat_template_kwargs
+    )
+    for index in range(target_index + 1, target_end_index + 1):
+        ids = _c2kv_template_ids(
+            tokenizer, messages[: index + 1], tools, chat_template_kwargs
+        )
+        if ids[: len(prev_ids)] != prev_ids:
+            raise ValueError(
+                "chat template rendering is not prefix-stable at message "
+                f"{index}; refusing to build a multi-message repair span"
+            )
+        if len(ids) <= len(prev_ids):
+            raise ValueError(f"message {index} contributes no tokens")
+        ends.append(len(ids))
+        prev_ids = ids
+    full_ids = prev_ids
+    span_end = ends[-1]
+    bounds = []
+    cursor = span_start
+    for end in ends:
+        bounds.append([cursor - span_start, end - span_start])
+        cursor = end
+    return full_ids, span_start, span_end, rendered_prefix_len, bounds
+
+
+@app.post("/v1/c2kv/repair_extract")
+async def v1_c2kv_repair_extract(
+    request: C2KVRepairExtractRequest, raw_request: Request
+) -> C2KVRepairExtractResponse:
+    """Extract and store raw/neutral repair KV for a span."""
+    try:
+        tokenizer_manager = _global_state.tokenizer_manager
+        tokenizer = tokenizer_manager.tokenizer
+        chat_template_kwargs = request.chat_template_kwargs or {}
+
+        span_start = request.span_start
+        span_end = request.span_end
+        position_offset = request.position_offset
+        raw_kv_position_mode = request.raw_kv_position_mode
+        history_kv_recovery_relative_indices = (
+            request.history_kv_recovery_relative_indices)
+        rendered_prefix_len = 0
+        kv_reuse_method = (request.kv_reuse_method or "").strip().lower() or None
+        cacheblend_cfg = None
+        if kv_reuse_method:
+            if kv_reuse_method != "cacheblend":
+                return C2KVRepairExtractResponse(
+                    key_hash="",
+                    success=False,
+                    error=f"Unsupported kv_reuse_method: {kv_reuse_method!r}.",
+                )
+            cacheblend_cfg = {
+                "recomp_ratio": request.cacheblend_recomp_ratio,
+                "check_layer": request.cacheblend_check_layer,
+                "metric": request.cacheblend_metric,
+                "mask": request.cacheblend_mask,
+                "chunk_tokens": request.cacheblend_chunk_tokens,
+                "chunk_bounds": request.cacheblend_chunk_bounds,
+            }
+        if request.messages is not None and request.target_end_index is not None:
+            # Multi-message span (CacheBlend chunks = messages): rendered like
+            # the single-message form, with per-message token boundaries.
+            input_ids, span_start, span_end, rendered_prefix_len, chunk_bounds = (
+                _render_c2kv_repair_span_range(
+                    tokenizer,
+                    request.messages,
+                    request.target_index,
+                    request.target_end_index,
+                    request.tools,
+                    chat_template_kwargs,
+                )
+            )
+            position_offset = 0
+            if (
+                cacheblend_cfg is not None
+                and not cacheblend_cfg.get("chunk_bounds")
+                and not cacheblend_cfg.get("chunk_tokens")
+            ):
+                # one chunk per message; an explicit grid (chunk_tokens) or
+                # explicit bounds win over the message boundaries
+                cacheblend_cfg["chunk_bounds"] = chunk_bounds
+            # a multi-message span is only ever re-placed at its own positions
+            raw_kv_position_mode = "rotated"
+        elif request.messages is not None:
+            # Full-context form: the raw KV of messages[target_index] inside the
+            # chat-template rendering of messages[:target_index+1] (with tools),
+            # i.e. what the base model computes for that message in the exact
+            # context a chat request would give it. Positions are absolute in
+            # that rendering, position_offset is ignored (0).
+            input_ids, span_start, span_end, rendered_prefix_len = (
+                _render_c2kv_repair_span(
+                    tokenizer,
+                    request.messages,
+                    request.target_index,
+                    request.tools,
+                    chat_template_kwargs,
+                )
+            )
+            position_offset = 0
+            # Storage form. `raw_kv_position_mode` is the only client-facing
+            # control of it (there is no `already_rotated` field on the wire),
+            # and its field default is upstream's "rotated" = post-RoPE, which
+            # can only ever be re-used at its original position and is rejected
+            # by the `append_tail` placement. The messages/target_index form is
+            # exactly the form whose entries are meant to be re-placed, so when
+            # the caller says nothing it defaults to pre-RoPE. The input_ids and
+            # text forms keep the field default, and an explicit
+            # raw_kv_position_mode always wins. See
+            # c2kv/c2kv_serving_semantics.md section 3.
+            fields_set = getattr(request, "model_fields_set", None)
+            if fields_set is None:
+                fields_set = getattr(request, "__fields_set__", None) or ()
+            if "raw_kv_position_mode" not in fields_set:
+                # CacheBlend entries are post-RoPE at their native positions
+                raw_kv_position_mode = "rotated" if cacheblend_cfg else "pre_rope"
+            if request.history_kv_recovery_mode:
+                char_start = request.history_kv_recovery_char_start
+                char_end = request.history_kv_recovery_char_end
+                if char_start is None or char_end is None:
+                    raise ValueError(
+                        "history KV recovery requires char_start and char_end")
+                target_text = str(
+                    (request.messages[request.target_index] or {}).get("content") or "")
+                if not (0 <= int(char_start) < int(char_end) <= len(target_text)):
+                    raise ValueError(
+                        "invalid history recovery character range "
+                        f"[{char_start}, {char_end}) for {len(target_text)} chars")
+                flat_tools = _c2kv_flat_tools(request.tools)
+                rendered = tokenizer.apply_chat_template(
+                    list(request.messages[: request.target_index + 1]),
+                    tokenize=False,
+                    add_generation_prompt=False,
+                    tools=flat_tools,
+                    **chat_template_kwargs,
+                )
+                if tokenizer.bos_token and rendered.startswith(tokenizer.bos_token):
+                    rendered = rendered[len(tokenizer.bos_token):]
+                content_start = rendered.rfind(target_text)
+                if content_start < 0:
+                    raise ValueError(
+                        "could not locate history content in rendered repair prompt")
+                encoded = tokenizer(
+                    rendered, add_special_tokens=False,
+                    return_offsets_mapping=True)
+                if list(encoded["input_ids"]) != list(input_ids):
+                    raise ValueError(
+                        "offset tokenization differs from repair prompt tokenization")
+                absolute_char_start = content_start + int(char_start)
+                absolute_char_end = content_start + int(char_end)
+                selected_absolute = [
+                    index for index, (start, end) in enumerate(
+                        encoded["offset_mapping"])
+                    if int(end) > absolute_char_start
+                    and int(start) < absolute_char_end
+                    and span_start <= index < span_end
+                ]
+                history_kv_recovery_relative_indices = [
+                    index - span_start for index in selected_absolute]
+                if not history_kv_recovery_relative_indices:
+                    raise ValueError(
+                        "history recovery character range maps to no span tokens")
+        elif request.input_ids is not None:
+            input_ids = list(request.input_ids)
+        elif request.role:
+            text_str = tokenizer.apply_chat_template(
+                [{"role": request.role, "content": request.text}],
+                tokenize=False,
+                add_generation_prompt=False,
+                **chat_template_kwargs,
+            )
+            if tokenizer.bos_token and text_str.startswith(tokenizer.bos_token):
+                text_str = text_str[len(tokenizer.bos_token):]
+            input_ids = tokenizer.encode(text_str, add_special_tokens=False)
+        else:
+            input_ids = tokenizer.encode(request.text)
+        if not isinstance(input_ids, list):
+            input_ids = list(input_ids)
+        if not input_ids:
+            return C2KVRepairExtractResponse(
+                key_hash="",
+                success=False,
+                error="The repair input contributes no tokens.",
+            )
+
+        span_end = len(input_ids) if span_end is None else span_end
+        result = await tokenizer_manager.c2kv_repair_extract(
+            input_ids=input_ids,
+            input_text=request.text,
+            span_start=span_start,
+            span_end=span_end,
+            # NOTE: the local `position_offset`, not request.position_offset --
+            # the messages/target_index form forces it to 0 (absolute positions
+            # in the rendered prefix).
+            position_offset=position_offset,
+            repair_position_ids=request.repair_position_ids,
+            # NOTE: the local `raw_kv_position_mode`, not
+            # request.raw_kv_position_mode -- the messages/target_index form
+            # defaults it to "pre_rope" when the caller did not send the field.
+            raw_kv_position_mode=raw_kv_position_mode,
+            repair_mode=request.repair_mode,
+            source_doc_index=request.source_doc_index,
+            extract_source=request.extract_source,
+            history_kv_method=request.history_kv_method,
+            history_kv_target_tokens=request.history_kv_target_tokens,
+            history_kv_retention_ratio=request.history_kv_retention_ratio,
+            history_kv_recent_window=request.history_kv_recent_window,
+            history_kv_kernel_size=request.history_kv_kernel_size,
+            history_kv_pooling=request.history_kv_pooling,
+            history_kv_h2o_recent_fraction=request.history_kv_h2o_recent_fraction,
+            history_kv_selectable_relative_indices=(
+                request.history_kv_selectable_relative_indices),
+            history_kv_mandatory_relative_indices=(
+                request.history_kv_mandatory_relative_indices),
+            history_kv_recovery_mode=request.history_kv_recovery_mode,
+            history_kv_recovery_relative_indices=(
+                history_kv_recovery_relative_indices),
+            kv_reuse_method=kv_reuse_method,
+            cacheblend=cacheblend_cfg,
+            outer_request_id=raw_request.headers.get(
+                "X-C2KV-Measurement-Request-Id"
+            ),
+            measurement_phase=raw_request.headers.get("X-C2KV-Measurement-Phase"),
+        )
+        return C2KVRepairExtractResponse(
+            key_hash=result.key_hash,
+            token_len=result.token_len,
+            position_start=result.position_start,
+            position_end=result.position_end,
+            original_seq_len=result.original_seq_len,
+            repair_mode=result.repair_mode,
+            extract_source=result.extract_source,
+            cache_hit_tokens=result.cache_hit_tokens,
+            serving_kv_buffer_shape=(
+                list(result.serving_kv_buffer_shape)
+                if result.serving_kv_buffer_shape is not None
+                else None
+            ),
+            paper_measurement=result.paper_measurement,
+            history_kv_method=result.history_kv_method,
+            requested_span_tokens=result.requested_span_tokens,
+            selected_token_count=result.selected_token_count,
+            selected_relative_indices=result.selected_relative_indices,
+            history_selection_metadata=getattr(result, "history_selection_metadata", None),
+            kv_reuse_method=getattr(result, "kv_reuse_method", None),
+            cacheblend=getattr(result, "cacheblend", None),
+            already_rotated=bool(getattr(result, "already_rotated", False)),
+            span_start=int(span_start),
+            span_end=int(span_end),
+            rendered_prefix_len=int(rendered_prefix_len),
+            success=result.success,
+            error=result.error or None,
+        )
+    except Exception as e:
+        return C2KVRepairExtractResponse(
+            key_hash="",
+            token_len=0,
+            success=False,
+            error=str(e),
+        )
+
+
+@app.post(
+    "/v1/embeddings",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+)
+async def openai_v1_embeddings(request: EmbeddingRequest, raw_request: Request):
+    """OpenAI-compatible embeddings endpoint."""
+    return await raw_request.app.state.openai_serving_embedding.handle_request(
+        request, raw_request
+    )
+
+
+@app.post(
+    "/v1/classify",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+)
+async def openai_v1_classify(request: ClassifyRequest, raw_request: Request):
+    """OpenAI-compatible classification endpoint."""
+    return await raw_request.app.state.openai_serving_classify.handle_request(
+        request, raw_request
+    )
+
+
+@app.post(
+    "/v1/tokenize",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+)
+@app.post(
+    "/tokenize",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+    include_in_schema=False,
+)
+async def openai_v1_tokenize(request: TokenizeRequest, raw_request: Request):
+    """OpenAI-compatible tokenization endpoint."""
+    return await raw_request.app.state.openai_serving_tokenize.handle_request(
+        request, raw_request
+    )
+
+
+@app.post(
+    "/v1/detokenize",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+)
+@app.post(
+    "/detokenize",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+    include_in_schema=False,
+)
+async def openai_v1_detokenize(request: DetokenizeRequest, raw_request: Request):
+    """OpenAI-compatible detokenization endpoint."""
+    return await raw_request.app.state.openai_serving_detokenize.handle_request(
+        request, raw_request
+    )
+
+
+@app.post("/v1/audio/transcriptions")
+async def openai_v1_audio_transcriptions(
+    raw_request: Request,
+    file: UploadFile = File(...),
+    model: str = Form(default="default"),
+    language: Optional[str] = Form(default=None),
+    response_format: str = Form(default="json"),
+    temperature: float = Form(default=0.0),
+    stream: bool = Form(default=False),
+    timestamp_granularities: Optional[List[str]] = Form(
+        default=None, alias="timestamp_granularities[]"
+    ),
+):
+    """OpenAI-compatible audio transcription endpoint."""
+    if response_format not in ["json", "text", "verbose_json"]:
+        return ORJSONResponse(
+            content={
+                "error": {
+                    "message": "Only 'json', 'text', and 'verbose_json' formats supported"
+                }
+            },
+            status_code=400,
+        )
+
+    audio_data = await file.read()
+
+    return (
+        await raw_request.app.state.openai_serving_transcription.create_transcription(
+            audio_data=audio_data,
+            model=model,
+            language=language,
+            response_format=response_format,
+            temperature=temperature,
+            stream=stream,
+            timestamp_granularities=timestamp_granularities,
+            raw_request=raw_request,
+        )
+    )
+
+
+@app.get("/v1/models", response_class=ORJSONResponse)
+async def available_models():
+    """Show available models. OpenAI-compatible endpoint."""
+    served_model_names = [_global_state.tokenizer_manager.served_model_name]
+    model_cards = []
+
+    # Add base model
+    for served_model_name in served_model_names:
+        model_cards.append(
+            ModelCard(
+                id=served_model_name,
+                root=served_model_name,
+                max_model_len=_global_state.tokenizer_manager.model_config.context_len,
+            )
+        )
+
+    # Add loaded LoRA adapters
+    if _global_state.tokenizer_manager.server_args.enable_lora:
+        lora_registry = _global_state.tokenizer_manager.lora_registry
+        for _, lora_ref in lora_registry.get_all_adapters().items():
+            model_cards.append(
+                ModelCard(
+                    id=lora_ref.lora_name,
+                    root=lora_ref.lora_path,
+                    parent=served_model_names[0],
+                    max_model_len=None,
+                )
+            )
+
+    return ModelList(data=model_cards)
+
+
+@app.get("/v1/models/{model:path}", response_class=ORJSONResponse)
+async def retrieve_model(model: str):
+    """Retrieves a model instance, providing basic information about the model."""
+    served_model_names = [_global_state.tokenizer_manager.served_model_name]
+
+    if model not in served_model_names:
+        return ORJSONResponse(
+            status_code=404,
+            content={
+                "error": {
+                    "message": f"The model '{model}' does not exist",
+                    "type": "invalid_request_error",
+                    "param": "model",
+                    "code": "model_not_found",
+                }
+            },
+        )
+
+    return ModelCard(
+        id=model,
+        root=model,
+        max_model_len=_global_state.tokenizer_manager.model_config.context_len,
+    )
+
+
+@app.post("/v1/score", dependencies=[Depends(validate_json_request)])
+async def v1_score_request(request: ScoringRequest, raw_request: Request):
+    """Endpoint for the decoder-only scoring API. See Engine.score() for detailed documentation."""
+    return await raw_request.app.state.openai_serving_score.handle_request(
+        request, raw_request
+    )
+
+
+@app.post("/v1/responses", dependencies=[Depends(validate_json_request)])
+async def v1_responses_request(request: dict, raw_request: Request):
+    """Endpoint for the responses API with reasoning support."""
+
+    request_obj = ResponsesRequest(**request)
+    result = await raw_request.app.state.openai_serving_responses.create_responses(
+        request_obj, raw_request
+    )
+
+    # Handle streaming responses
+    if isinstance(result, AsyncGenerator):
+        return StreamingResponse(
+            result,
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+
+    return result
+
+
+@app.get("/v1/responses/{response_id}")
+async def v1_retrieve_responses(response_id: str, raw_request: Request):
+    """Retrieve a response by ID."""
+    return await raw_request.app.state.openai_serving_responses.retrieve_responses(
+        response_id
+    )
+
+
+@app.post("/v1/responses/{response_id}/cancel")
+async def v1_cancel_responses(response_id: str, raw_request: Request):
+    """Cancel a background response."""
+    return await raw_request.app.state.openai_serving_responses.cancel_responses(
+        response_id
+    )
+
+
+@app.api_route(
+    "/v1/rerank", methods=["POST", "PUT"], dependencies=[Depends(validate_json_request)]
+)
+async def v1_rerank_request(request: V1RerankReqInput, raw_request: Request):
+    """Endpoint for reranking documents based on query relevance."""
+    return await raw_request.app.state.openai_serving_rerank.handle_request(
+        request, raw_request
+    )
+
+
+##### Ollama-compatible API endpoints #####
+
+_ollama_root_route = os.environ.get("SGLANG_OLLAMA_ROOT_ROUTE")
+if _ollama_root_route is not None:
+
+    @app.get(_ollama_root_route)
+    @app.head(_ollama_root_route)
+    async def ollama_root():
+        """Ollama-compatible root endpoint."""
+        return "Ollama is running"
+
+else:
+
+    @app.get("/")
+    @app.head("/")
+    async def sglang_root():
+        """Default root endpoint."""
+        return "SGLang is running"
+
+
+@app.post(os.environ.get("SGLANG_OLLAMA_CHAT_ROUTE", "/api/chat"))
+async def ollama_chat(request: OllamaChatRequest, raw_request: Request):
+    """Ollama-compatible chat endpoint."""
+    return await raw_request.app.state.ollama_serving.handle_chat(request, raw_request)
+
+
+@app.post(os.environ.get("SGLANG_OLLAMA_GENERATE_ROUTE", "/api/generate"))
+async def ollama_generate(request: OllamaGenerateRequest, raw_request: Request):
+    """Ollama-compatible generate endpoint."""
+    return await raw_request.app.state.ollama_serving.handle_generate(
+        request, raw_request
+    )
+
+
+@app.get(os.environ.get("SGLANG_OLLAMA_TAGS_ROUTE", "/api/tags"))
+async def ollama_tags(raw_request: Request):
+    """Ollama-compatible list models endpoint."""
+    return raw_request.app.state.ollama_serving.get_tags()
+
+
+@app.post(os.environ.get("SGLANG_OLLAMA_SHOW_ROUTE", "/api/show"))
+async def ollama_show(request: OllamaShowRequest, raw_request: Request):
+    """Ollama-compatible show model info endpoint."""
+    return raw_request.app.state.ollama_serving.get_show(request.model)
+
+
+##### Anthropic-compatible API endpoints #####
+
+
+@app.post("/v1/messages", dependencies=[Depends(validate_json_request)])
+async def anthropic_v1_messages(
+    request: AnthropicMessagesRequest, raw_request: Request
+):
+    """Anthropic-compatible Messages API endpoint."""
+    return await raw_request.app.state.anthropic_serving.handle_messages(
+        request, raw_request
+    )
+
+
+@app.post("/v1/messages/count_tokens", dependencies=[Depends(validate_json_request)])
+async def anthropic_v1_count_tokens(
+    request: AnthropicCountTokensRequest, raw_request: Request
+):
+    """Anthropic-compatible token counting endpoint."""
+    return await raw_request.app.state.anthropic_serving.handle_count_tokens(
+        request, raw_request
+    )
+
+
+## SageMaker API
+@app.get("/ping")
+async def sagemaker_health() -> Response:
+    """Check the health of the http server."""
+    return Response(status_code=200)
+
+
+@app.post("/invocations")
+async def sagemaker_chat_completions(
+    request: ChatCompletionRequest, raw_request: Request
+):
+    """OpenAI-compatible chat completion endpoint."""
+    return await raw_request.app.state.openai_serving_chat.handle_request(
+        request, raw_request
+    )
+
+
+## Vertex AI API
+@app.post(os.environ.get("AIP_PREDICT_ROUTE", "/vertex_generate"))
+async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Request):
+    if not vertex_req.instances:
+        return []
+    inputs = {}
+    for input_key in ("text", "input_ids", "input_embeds"):
+        if vertex_req.instances[0].get(input_key):
+            inputs[input_key] = [
+                instance.get(input_key) for instance in vertex_req.instances
+            ]
+            break
+    image_data = [
+        instance.get("image_data")
+        for instance in vertex_req.instances
+        if instance.get("image_data") is not None
+    ] or None
+    req = GenerateReqInput(
+        **inputs,
+        image_data=image_data,
+        **(vertex_req.parameters or {}),
+    )
+    ret = await generate_request(req, raw_request)
+    if isinstance(ret, Response):
+        return ret
+    return ORJSONResponse({"predictions": ret})
+
+
+def _create_error_response(e):
+    return ORJSONResponse(
+        {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+    )
+
+
+# FIXME: In theory we should configure ADMIN_FORCE for some entrypoints, but doing so
+# would currently cause all endpoints to go through add_api_key_middleware
+# (even when neither api-key nor admin-api-key is configured).
+#
+# For now, we simulate ADMIN_FORCE by explicitly checking the admin API key parameter.
+# Once the auth wiring is refactored so ADMIN_FORCE only affects the intended
+# admin endpoints, we should switch this logic to use ADMIN_FORCE directly.
+def _admin_api_key_missing_response(
+    status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,
+) -> ORJSONResponse:
+    return ORJSONResponse(
+        content={
+            "error": (
+                "This endpoint requires admin API key, but this server was started "
+                "without one (admin-api-key). Restart with --admin-api-key to enable."
+            )
+        },
+        status_code=status_code,
+    )
+
+
+# Minimal 32x32 black PNG (base64, GLM4v requires at least 32x32 sized image)
+MINIMUM_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
+
+
+def _execute_server_warmup(server_args: ServerArgs):
+    headers = {}
+    url = server_args.url()
+    if server_args.api_key:
+        headers["Authorization"] = f"Bearer {server_args.api_key}"
+
+    ssl_verify = server_args.ssl_verify()
+
+    # Wait until the server is launched
+    success = False
+    for _ in range(120):
+        time.sleep(1)
+        try:
+            res = requests.get(
+                url + "/model_info", timeout=5, headers=headers, verify=ssl_verify
+            )
+            assert res.status_code == 200, f"{res=}, {res.text=}"
+            success = True
+            break
+        except (AssertionError, requests.exceptions.RequestException):
+            last_traceback = get_exception_traceback()
+            pass
+
+    if not success:
+        logger.error(f"Initialization failed. warmup error: {last_traceback}")
+        kill_process_tree(os.getpid())
+        return success
+
+    model_info = res.json()
+
+    # Construct a warmup request
+    is_vlm = bool(model_info.get("has_image_understanding", False))
+    if model_info["is_generation"]:
+        if is_vlm and not server_args.skip_tokenizer_init:
+            request_name = "/v1/chat/completions"
+        else:
+            request_name = "/generate"
+    else:
+        request_name = "/encode"
+    max_new_tokens = 8 if model_info["is_generation"] else 1
+    json_data = {
+        "sampling_params": {
+            "temperature": 0,
+            "max_new_tokens": max_new_tokens,
+        },
+    }
+    if server_args.skip_tokenizer_init:
+        json_data["input_ids"] = [[10, 11, 12] for _ in range(server_args.dp_size)]
+        # TODO Workaround the bug that embedding errors for list of size 1
+        if server_args.dp_size == 1:
+            json_data["input_ids"] = json_data["input_ids"][0]
+    elif (
+        is_vlm
+        and server_args.disaggregation_mode == "null"
+        and model_info["is_generation"]
+    ):
+        # TODO: ChatCompletionRequest does not have bootstrap info required by disaggregation mode, disable image-warmup for now
+        # Only use chat completions format for generation models, not embedding models
+        json_data = {
+            "model": _global_state.tokenizer_manager.served_model_name,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{MINIMUM_PNG_PICTURE_BASE64}"
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": "Describe the image.",
+                        },
+                    ],
+                }
+            ],
+            "max_tokens": max_new_tokens,
+            "stream": False,
+            "temperature": 0.0,
+        }
+    else:
+        json_data["text"] = ["The capital city of France is"] * server_args.dp_size
+        # TODO Workaround the bug that embedding errors for list of size 1
+        if server_args.dp_size == 1:
+            json_data["text"] = json_data["text"][0]
+
+    # Config debug dumping
+    if server_args.debug_tensor_dump_input_file:
+        json_data.pop("text", None)
+        json_data["input_ids"] = np.load(
+            server_args.debug_tensor_dump_input_file
+        ).tolist()
+        json_data["sampling_params"]["max_new_tokens"] = 0
+
+    # Send a warmup request
+    warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
+    try:
+        if server_args.disaggregation_mode == "null":
+            res = requests.post(
+                url + request_name,
+                json=json_data,
+                headers=headers,
+                timeout=warmup_timeout if warmup_timeout > 0 else 600,
+                verify=ssl_verify,
+            )
+            assert res.status_code == 200, f"{res.text}"
+            _global_state.tokenizer_manager.server_status = ServerStatus.Up
+
+        else:
+            logger.info(f"Start of pd disaggregation warmup ...")
+            json_data = {
+                "sampling_params": {
+                    "temperature": 0.0,
+                    "max_new_tokens": 8,
+                    "ignore_eos": True,
+                },
+                "bootstrap_host": [FAKE_BOOTSTRAP_HOST] * server_args.dp_size,
+                # This is a hack to ensure fake transfer is enabled during prefill warmup
+                # ensure each dp rank has a unique bootstrap_room during prefill warmup
+                "bootstrap_room": [
+                    i * (2**63 // server_args.dp_size) + (i % server_args.tp_size)
+                    for i in range(server_args.dp_size)
+                ],
+                "input_ids": [[10, 11, 12, 13]] * server_args.dp_size,
+            }
+            res = requests.post(
+                url + request_name,
+                json=json_data,
+                headers=headers,
+                timeout=(
+                    warmup_timeout if warmup_timeout > 0 else 1800
+                ),  # because of deep gemm precache is very long if not precache.
+                verify=ssl_verify,
+            )
+            if res.status_code == 200:
+                logger.info(
+                    f"End of prefill disaggregation mode warmup with status {res.status_code}, resp: {res.json()}"
+                )
+                _global_state.tokenizer_manager.server_status = ServerStatus.Up
+            else:
+                logger.info(
+                    "Prefill disaggregation mode warm Up Failed, status code: {}".format(
+                        res.status_code
+                    )
+                )
+                _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
+
+    except Exception:
+        last_traceback = get_exception_traceback()
+        logger.error(f"Initialization failed. warmup error: {last_traceback}")
+        kill_process_tree(os.getpid())
+        return False
+
+    # Debug print
+    # logger.info(f"warmup request returns: {res.json()=}")
+    return success
+
+
+def _wait_and_warmup(
+    server_args: ServerArgs,
+    launch_callback: Optional[Callable[[], None]] = None,
+    execute_warmup_func: Callable = _execute_server_warmup,
+):
+    if server_args.checkpoint_engine_wait_weights_before_ready:
+        _wait_weights_ready()
+
+    # Send a warmup request
+    if not server_args.skip_server_warmup:
+        if not execute_warmup_func(server_args):
+            return
+    else:
+        _global_state.tokenizer_manager.server_status = ServerStatus.Up
+
+    # The server is ready for requests
+    logger.info("The server is fired up and ready to roll!")
+
+    if server_args.delete_ckpt_after_loading:
+        delete_directory(server_args.model_path)
+
+    if server_args.debug_tensor_dump_input_file:
+        kill_process_tree(os.getpid())
+
+    if launch_callback is not None:
+        launch_callback()
+
+
+def _wait_weights_ready():
+    """Wait for weights to be ready within the specified timeout."""
+    timeout = WAIT_WEIGHTS_READY_TIMEOUT
+    start_time = time.time()
+
+    for _ in range(timeout):
+        if _global_state.tokenizer_manager.initial_weights_loaded:
+            logger.info(
+                f"Weights are ready after {time.time() - start_time:.2f} seconds"
+            )
+            return
+        time.sleep(1)
+
+    # Timeout reached without weights being ready
+    logger.error(
+        f"Weights are not ready after waiting {timeout} seconds. "
+        f"Consider increasing SGLANG_WAIT_WEIGHTS_READY_TIMEOUT environment variable. "
+        f"Current status: initial_weights_loaded={_global_state.tokenizer_manager.initial_weights_loaded}"
+    )
+
+
+def _setup_and_run_http_server(
+    server_args: ServerArgs,
+    tokenizer_manager,
+    template_manager,
+    port_args: PortArgs,
+    scheduler_infos: List[Dict],
+    subprocess_watchdog: Optional[SubprocessWatchdog],
+    execute_warmup_func: Callable = _execute_server_warmup,
+    launch_callback: Optional[Callable[[], None]] = None,
+):
+    """Set up global state, configure middleware, and run uvicorn.
+
+    Called by launch_server after subprocesses have been launched.
+    """
+    # Set global states
+    set_global_state(
+        _GlobalState(
+            tokenizer_manager=tokenizer_manager,
+            template_manager=template_manager,
+            scheduler_info=scheduler_infos[0],
+        )
+    )
+
+    # Store watchdog on tokenizer_manager (single source of truth for SIGQUIT handler)
+    if tokenizer_manager is not None:
+        tokenizer_manager._subprocess_watchdog = subprocess_watchdog
+
+    if server_args.enable_metrics:
+        add_prometheus_track_response_middleware(app)
+
+    # Pass additional arguments to the lifespan function.
+    # They will be used for additional initialization setups.
+    if server_args.tokenizer_worker_num == 1:
+        # If it is single tokenizer mode, we can pass the arguments by attributes of the app object.
+        app.is_single_tokenizer_mode = True
+        app.server_args = server_args
+        app.warmup_thread_kwargs = dict(
+            server_args=server_args,
+            launch_callback=launch_callback,
+            execute_warmup_func=execute_warmup_func,
+        )
+
+        # Add api key authorization
+        # This is only supported in single tokenizer mode.
+        #
+        # Backward compatibility:
+        # - api_key only: behavior matches legacy (all endpoints require api_key)
+        # - no keys: legacy had no restriction; ADMIN_FORCE endpoints must still be rejected when
+        #   admin_api_key is not configured.
+        if (
+            server_args.api_key
+            or server_args.admin_api_key
+            or app_has_admin_force_endpoints(app)
+        ):
+            from sglang.srt.utils.auth import add_api_key_middleware
+
+            add_api_key_middleware(
+                app,
+                api_key=server_args.api_key,
+                admin_api_key=server_args.admin_api_key,
+            )
+    else:
+        # If it is multi-tokenizer mode, we need to write the arguments to shared memory
+        # for other worker processes to read.
+        app.is_single_tokenizer_mode = False
+        multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
+            port_args, server_args, scheduler_infos[0]
+        )
+
+    try:
+        # Update logging configs
+        set_uvicorn_logging_configs(server_args)
+
+        if server_args.ssl_certfile:
+            logger.info(
+                f"SSL enabled: certfile={server_args.ssl_certfile}, "
+                f"keyfile={server_args.ssl_keyfile}"
+            )
+
+        # Listen for HTTP requests
+        if server_args.tokenizer_worker_num == 1:
+            if server_args.enable_ssl_refresh:
+                # Use Config/Server API for access to the SSLContext.
+                config = uvicorn.Config(
+                    app,
+                    host=server_args.host,
+                    port=server_args.port,
+                    root_path=server_args.fastapi_root_path,
+                    log_level=server_args.log_level_http or server_args.log_level,
+                    timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
+                    loop="uvloop",
+                    ssl_keyfile=server_args.ssl_keyfile,
+                    ssl_certfile=server_args.ssl_certfile,
+                    ssl_ca_certs=server_args.ssl_ca_certs,
+                    ssl_keyfile_password=server_args.ssl_keyfile_password,
+                )
+                config.load()  # Creates the SSLContext
+
+                from sglang.srt.entrypoints.ssl_utils import SSLCertRefresher
+
+                server = uvicorn.Server(config)
+
+                async def _run_with_ssl_refresh():
+                    refresher = SSLCertRefresher(
+                        config.ssl,
+                        server_args.ssl_keyfile,
+                        server_args.ssl_certfile,
+                        server_args.ssl_ca_certs,
+                    )
+                    logger.info("SSL certificate auto-refresh enabled.")
+                    try:
+                        await server.serve()
+                    finally:
+                        refresher.stop()
+
+                import asyncio
+
+                asyncio.run(_run_with_ssl_refresh())
+            else:
+                # Default case, one tokenizer process
+                uvicorn.run(
+                    app,
+                    host=server_args.host,
+                    port=server_args.port,
+                    root_path=server_args.fastapi_root_path,
+                    log_level=server_args.log_level_http or server_args.log_level,
+                    timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
+                    loop="uvloop",
+                    ssl_keyfile=server_args.ssl_keyfile,
+                    ssl_certfile=server_args.ssl_certfile,
+                    ssl_ca_certs=server_args.ssl_ca_certs,
+                    ssl_keyfile_password=server_args.ssl_keyfile_password,
+                )
+        else:
+            # Multiple tokenizer and http processes
+            from uvicorn.config import LOGGING_CONFIG
+
+            LOGGING_CONFIG["loggers"]["sglang.srt.entrypoints.http_server"] = {
+                "handlers": ["default"],
+                "level": "INFO",
+                "propagate": False,
+            }
+            monkey_patch_uvicorn_multiprocessing()
+
+            if server_args.enable_ssl_refresh:
+                logger.warning(
+                    "--enable-ssl-refresh is not supported with multiple "
+                    "tokenizer workers (--tokenizer-worker-num > 1). "
+                    "SSL refresh will be disabled."
+                )
+
+            uvicorn.run(
+                "sglang.srt.entrypoints.http_server:app",
+                host=server_args.host,
+                port=server_args.port,
+                root_path=server_args.fastapi_root_path,
+                log_level=server_args.log_level_http or server_args.log_level,
+                timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
+                loop="uvloop",
+                workers=server_args.tokenizer_worker_num,
+                ssl_keyfile=server_args.ssl_keyfile,
+                ssl_certfile=server_args.ssl_certfile,
+                ssl_ca_certs=server_args.ssl_ca_certs,
+                ssl_keyfile_password=server_args.ssl_keyfile_password,
+            )
+    finally:
+        if server_args.tokenizer_worker_num > 1:
+            if multi_tokenizer_args_shm is not None:
+                multi_tokenizer_args_shm.unlink()
+            if _global_state is not None:
+                _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
+
+
+def launch_server(
+    server_args: ServerArgs,
+    init_tokenizer_manager_func: Callable = init_tokenizer_manager,
+    run_scheduler_process_func: Callable = run_scheduler_process,
+    run_detokenizer_process_func: Callable = run_detokenizer_process,
+    execute_warmup_func: Callable = _execute_server_warmup,
+    launch_callback: Optional[Callable[[], None]] = None,
+):
+    """
+    Launch SRT (SGLang Runtime) Server.
+
+    The SRT server consists of an HTTP server and an SRT engine.
+
+    - HTTP server: A FastAPI server that routes requests to the engine.
+    - The engine consists of three components:
+        1. TokenizerManager: Tokenizes the requests and sends them to the scheduler.
+        2. Scheduler (subprocess): Receives requests from the Tokenizer Manager, schedules batches, forwards them, and sends the output tokens to the Detokenizer Manager.
+        3. DetokenizerManager (subprocess): Detokenizes the output tokens and sends the result back to the Tokenizer Manager.
+
+    Note:
+    1. The HTTP server, Engine, and TokenizerManager all run in the main process.
+    2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
+    """
+    # Launch subprocesses
+    (
+        tokenizer_manager,
+        template_manager,
+        port_args,
+        scheduler_init_result,
+        subprocess_watchdog,
+    ) = Engine._launch_subprocesses(
+        server_args=server_args,
+        init_tokenizer_manager_func=init_tokenizer_manager_func,
+        run_scheduler_process_func=run_scheduler_process_func,
+        run_detokenizer_process_func=run_detokenizer_process_func,
+    )
+
+    _setup_and_run_http_server(
+        server_args,
+        tokenizer_manager,
+        template_manager,
+        port_args,
+        scheduler_init_result.scheduler_infos,
+        subprocess_watchdog,
+        execute_warmup_func=execute_warmup_func,
+        launch_callback=launch_callback,
+    )

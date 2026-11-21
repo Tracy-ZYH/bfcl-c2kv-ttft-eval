@@ -1,0 +1,3077 @@
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import logging
+import math
+import time
+import uuid
+from http import HTTPStatus
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
+
+import jinja2
+import orjson
+from fastapi import Request
+from fastapi.responses import ORJSONResponse, StreamingResponse
+from jsonschema import Draft202012Validator, SchemaError
+
+from sglang.srt.entrypoints.openai.encoding_dsv32 import encode_messages
+from sglang.srt.entrypoints.openai.protocol import (
+    chat_template_tools_dump,
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    ChatCompletionResponseChoice,
+    ChatCompletionResponseStreamChoice,
+    ChatCompletionStreamResponse,
+    ChatCompletionTokenLogprob,
+    ChatMessage,
+    ChoiceLogprobs,
+    DeltaMessage,
+    ErrorResponse,
+    FunctionResponse,
+    LogProbs,
+    MessageProcessingResult,
+    SglExt,
+    ToolCall,
+    ToolCallProcessingResult,
+    ToolChoice,
+    TopLogprob,
+)
+from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
+from sglang.srt.entrypoints.openai.utils import (
+    process_cached_tokens_details_from_ret,
+    process_hidden_states_from_ret,
+    process_routed_experts_from_ret,
+    should_include_usage,
+    to_openai_style_logprobs,
+)
+from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.function_call.json_array_parser import JsonArrayParser
+from sglang.srt.function_call.utils import get_json_schema_constraint
+from sglang.srt.managers.io_struct import CloseSessionReqInput, GenerateReqInput
+from sglang.srt.parser.conversation import generate_chat_conv
+from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
+from sglang.srt.parser.reasoning_parser import ReasoningParser
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.template_manager import TemplateManager
+    from sglang.srt.managers.tokenizer_manager import TokenizerManager
+
+logger = logging.getLogger(__name__)
+
+
+def _extract_max_dynamic_patch(request: ChatCompletionRequest):
+    img_vals = []
+    vid_vals = []
+    for msg in request.messages or []:
+        content = getattr(msg, "content", None)
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            # pydantic object or dict type
+            if getattr(part, "type", None) == "image_url":
+                iu = getattr(part, "image_url", None)
+                mdp = getattr(iu, "max_dynamic_patch", None) if iu else None
+                if mdp is not None:
+                    img_vals.append(int(mdp))
+            elif getattr(part, "type", None) == "video_url":
+                vu = getattr(part, "video_url", None)
+                mdp = getattr(vu, "max_dynamic_patch", None) if vu else None
+                if mdp is not None:
+                    vid_vals.append(int(mdp))
+
+    # TODO(yuan-luo): per-item max_dynamic_patch for both image and video
+    img_max_dynamic_patch = min(img_vals) if img_vals else None
+    vid_max_dynamic_patch = min(vid_vals) if vid_vals else None
+    return img_max_dynamic_patch, vid_max_dynamic_patch
+
+
+class OpenAIServingChat(OpenAIServingBase):
+    """Handler for /v1/chat/completions requests"""
+
+    _default_sampling_params_logged = False
+
+    def __init__(
+        self,
+        tokenizer_manager: TokenizerManager,
+        template_manager: TemplateManager,
+    ):
+        super().__init__(tokenizer_manager)
+        self.template_manager = template_manager
+        self.tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
+        self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
+
+        # Get default sampling parameters from model's generation config
+        self.default_sampling_params = (
+            self.tokenizer_manager.model_config.get_default_sampling_params()
+        )
+        if (
+            self.default_sampling_params
+            and not OpenAIServingChat._default_sampling_params_logged
+        ):
+            logger.info(
+                f"Using default chat sampling params from model generation config: {self.default_sampling_params}",
+            )
+            OpenAIServingChat._default_sampling_params_logged = True
+
+        # Check if the model is a GPT-OSS model
+        self.is_gpt_oss = (
+            hasattr(self.tokenizer_manager.model_config, "hf_config")
+            and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
+            and self.tokenizer_manager.model_config.hf_config.model_type == "gpt_oss"
+        )
+
+        self.use_dpsk_v32_encoding = self._use_dpsk_v32_encoding()
+        # Canonical full chat-token sequences used to turn an OpenAI chat
+        # request into an exact streaming-session delta. This stores token ids
+        # only; KV ownership stays in SessionAwareCache.
+        self._persistent_history_sessions: Dict[str, List[int]] = {}
+        self._persistent_history_generation_prefixes: Dict[str, List[int]] = {}
+        self._persistent_history_generation_bases: Dict[str, List[int]] = {}
+        self._persistent_history_computed_prefixes: Dict[str, int] = {}
+        self._persistent_history_exact_output: Dict[str, bool] = {}
+        self._persistent_history_tool_segments: Dict[str, List[Dict[str, Any]]] = {}
+        self._persistent_history_tool_source_digests: Dict[str, str] = {}
+
+    def release_persistent_history_session(self, session_id: str) -> None:
+        self._persistent_history_sessions.pop(session_id, None)
+        self._persistent_history_generation_prefixes.pop(session_id, None)
+        self._persistent_history_generation_bases.pop(session_id, None)
+        self._persistent_history_computed_prefixes.pop(session_id, None)
+        self._persistent_history_exact_output.pop(session_id, None)
+        self._persistent_history_tool_segments.pop(session_id, None)
+        self._persistent_history_tool_source_digests.pop(session_id, None)
+
+    @staticmethod
+    def _is_persistent_history_request(request: ChatCompletionRequest) -> bool:
+        hint = request.c2kv_kv_memory_hint
+        return bool(
+            isinstance(hint, dict)
+            and isinstance(hint.get("persistent_history_session"), dict)
+            and hint["persistent_history_session"].get("enabled")
+        )
+
+    def _reconcile_exact_generated_prefix(
+        self,
+        previous: List[int],
+        full_prompt_ids: List[int],
+        mismatch_at: int,
+        hint: Dict[str, Any],
+        c2kv_segments: Optional[List] = None,
+    ) -> List[int]:
+        """Keep generated token IDs when chat re-tokenization changes their BPE.
+
+        The prior output is already resident in KV. Its decoded text must be
+        precisely the prefix of the new rendered prompt, and that text must end
+        on a canonical token boundary. Message boundaries are then translated
+        into the actual, generated-token frame before the scheduler sees them.
+        """
+        tokenizer = self.tokenizer_manager.tokenizer
+
+        def decode(ids: List[int]) -> str:
+            return tokenizer.decode(
+                ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
+            )
+
+        previous_text = decode(previous)
+        if not decode(full_prompt_ids).startswith(previous_text):
+            raise ValueError("exact generated prefix text changed")
+        canonical_previous = tokenizer.encode(
+            previous_text, add_special_tokens=False
+        )
+        canonical_prefix_len = len(canonical_previous)
+        if (
+            full_prompt_ids[:canonical_prefix_len] != canonical_previous
+            or decode(canonical_previous) != previous_text
+        ):
+            raise ValueError("exact generated prefix has no canonical token boundary")
+
+        delta = full_prompt_ids[canonical_prefix_len:]
+        actual_prompt_ids = previous + delta
+        shift = len(previous) - canonical_prefix_len
+
+        def remap(index: int) -> int:
+            if not 0 <= index <= len(full_prompt_ids):
+                raise ValueError("history boundary is outside the rendered prompt")
+            if index <= mismatch_at:
+                return index
+            if index >= canonical_prefix_len:
+                return index + shift
+            # Earlier generated actions can have different BPE lengths too.
+            # Match their completed-message boundaries by decoded text, not by
+            # a single shift from the most recent action.
+            target = decode(full_prompt_ids[:index])
+            low, high = 0, len(previous)
+            while low < high:
+                middle = (low + high) // 2
+                if len(decode(previous[:middle])) < len(target):
+                    low = middle + 1
+                else:
+                    high = middle
+            if decode(previous[:low]) != target:
+                raise ValueError("history boundary bisects changed tokenization")
+            return low
+
+        updates = []
+        for config_name in ("history_kv_eviction", "paper_measurement"):
+            config = hint.get(config_name)
+            if isinstance(config, dict):
+                for key in ("history_start", "history_end"):
+                    if key in config:
+                        updates.append((config, key, remap(int(config[key]))))
+        for span in hint.get("history_kv_event_token_spans") or []:
+            for key in ("start", "end"):
+                updates.append((span, key, remap(int(span[key]))))
+        for segment in hint.get("tool_memory_segments") or []:
+            for key in ("token_start", "token_end"):
+                updates.append((segment, key, remap(int(segment[key]))))
+        for segment in c2kv_segments or []:
+            for key in ("token_start", "token_end"):
+                updates.append((segment, key, remap(int(getattr(segment, key)))))
+        suffix_key = "history_kv_event_generation_suffix_start"
+        if suffix_key in hint:
+            updates.append((hint, suffix_key, remap(int(hint[suffix_key]))))
+        for config, key, value in updates:
+            if isinstance(config, dict):
+                config[key] = value
+            else:
+                setattr(config, key, value)
+        hint["persistent_session_retokenization_reconciled"] = True
+        hint["persistent_session_retokenization_token_shift"] = shift
+        return actual_prompt_ids
+
+    def _prepare_persistent_history_delta(
+        self,
+        request: ChatCompletionRequest,
+        full_prompt_ids: List[int],
+        c2kv_segments: Optional[List] = None,
+    ) -> tuple[List[int], Optional[str], Optional[List[int]]]:
+        """Return the exact append delta for a streaming history session."""
+        if not self._is_persistent_history_request(request):
+            return full_prompt_ids, None, None
+        if request.stream:
+            raise ValueError("PERSISTENT_HISTORY_SESSION_STREAMING_UNSUPPORTED")
+        params = request.session_params or {}
+        session_id = params.get("id")
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("PERSISTENT_HISTORY_SESSION_ID_REQUIRED")
+        expected_id = (request.c2kv_kv_memory_hint.get("persistent_history_session") or {}).get("session_id")
+        if expected_id and expected_id != session_id:
+            raise ValueError("PERSISTENT_HISTORY_SESSION_ID_MISMATCH")
+        # Exact reference checkpoints keep generated K/V across turns. Their
+        # next prompt must therefore reproduce the raw generated token prefix;
+        # ordinary methods retain the canonical pre-decode prompt contract.
+        previous = self._persistent_history_sessions.get(session_id)
+        hint = request.c2kv_kv_memory_hint
+        config = hint.get("history_kv_eviction") if isinstance(hint, dict) else None
+        recovery_append = (hint.get("persistent_history_session") or {}).get(
+            "recovery_append"
+        )
+        recovery_append = bool(
+            isinstance(recovery_append, dict) and recovery_append.get("enabled")
+        )
+        # This is server-owned state, never a caller-selected truncation length.
+        hint.pop("persistent_session_drop_generation_prefix_tokens", None)
+        if previous is None:
+            if recovery_append:
+                raise ValueError("PERSISTENT_HISTORY_RECOVERY_REQUIRES_RESIDENT_SESSION")
+            if isinstance(config, dict):
+                config["persistent_session"] = True
+                config["persistent_continuation"] = False
+            if isinstance(hint, dict):
+                hint["persistent_session_logical_prefix_tokens"] = 0
+                hint["persistent_session_delta_tokens"] = len(full_prompt_ids)
+                hint["persistent_session_canonical_prompt_tokens"] = len(full_prompt_ids)
+            params["drop_previous_output"] = True
+            self._translate_tool_session_coordinates(request, 0, len(full_prompt_ids))
+            return full_prompt_ids, session_id, full_prompt_ids
+
+        logical_prefix = len(previous)
+        exact_output = bool(
+            getattr(self, "_persistent_history_exact_output", {}).get(session_id)
+        )
+        if recovery_append:
+            if exact_output:
+                raise ValueError(
+                    "PERSISTENT_HISTORY_RECOVERY_EXACT_OUTPUT_UNSUPPORTED"
+                )
+            generation_prefix = getattr(
+                self, "_persistent_history_generation_prefixes", {}
+            ).get(session_id)
+            if not generation_prefix or previous[-len(generation_prefix):] != generation_prefix:
+                raise ValueError("PERSISTENT_HISTORY_RECOVERY_GENERATION_PREFIX_UNAVAILABLE")
+            logical_prefix -= len(generation_prefix)
+            if (
+                len(full_prompt_ids) <= logical_prefix
+                or full_prompt_ids[:logical_prefix] != previous[:logical_prefix]
+            ):
+                raise ValueError("PERSISTENT_HISTORY_RECOVERY_BODY_PREFIX_MISMATCH")
+            hint["persistent_session_drop_generation_prefix_tokens"] = len(generation_prefix)
+
+        common = min(logical_prefix, len(full_prompt_ids))
+        if full_prompt_ids[:common] != previous[:common] or len(full_prompt_ids) < logical_prefix:
+            mismatch = next(
+                (
+                    i
+                    for i, (left, right) in enumerate(zip(previous, full_prompt_ids))
+                    if left != right
+                ),
+                common,
+            )
+            if exact_output and not recovery_append:
+                try:
+                    full_prompt_ids = self._reconcile_exact_generated_prefix(
+                        previous, full_prompt_ids, mismatch, hint, c2kv_segments
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        "PERSISTENT_HISTORY_SESSION_PREFIX_MISMATCH: "
+                        f"session_id={session_id}, previous_tokens={len(previous)}, "
+                        f"full_prompt_tokens={len(full_prompt_ids)}, "
+                        f"mismatch_at={mismatch}, reason={exc}"
+                    ) from exc
+            else:
+                raise ValueError(
+                    "PERSISTENT_HISTORY_SESSION_PREFIX_MISMATCH: "
+                    f"session_id={session_id}, previous_tokens={len(previous)}, "
+                    f"full_prompt_tokens={len(full_prompt_ids)}, mismatch_at={mismatch}"
+                )
+
+        delta = full_prompt_ids[logical_prefix :]
+        if not delta and isinstance(config, dict):
+            from sglang.srt.mem_cache.history_kv_lifecycle import (
+                ATTENTION_SELECTION_METHODS,
+            )
+
+            method = str(config.get("method") or "").strip().lower()
+            if method in ATTENTION_SELECTION_METHODS:
+                raise ValueError(
+                    "PERSISTENT_HISTORY_SELECTION_REQUIRES_NEW_QUERY: "
+                    f"method={method}, session_id={session_id}"
+                )
+        params["drop_previous_output"] = recovery_append or not exact_output
+        if isinstance(hint, dict):
+            hint["persistent_session_logical_prefix_tokens"] = logical_prefix
+            if exact_output and not recovery_append:
+                computed_prefix = int(
+                    getattr(self, "_persistent_history_computed_prefixes", {}).get(
+                        session_id, logical_prefix
+                    )
+                )
+                if not 0 <= computed_prefix <= logical_prefix:
+                    raise ValueError(
+                        "PERSISTENT_HISTORY_SESSION_COMPUTED_PREFIX_INVALID"
+                    )
+                hint["persistent_session_computed_prefix_tokens"] = computed_prefix
+            hint["persistent_session_delta_tokens"] = len(delta)
+            hint["persistent_session_canonical_prompt_tokens"] = len(full_prompt_ids)
+        if isinstance(config, dict):
+            history_end = int(config.get("history_end") or 0)
+            history_start = int(config.get("history_start") or 0)
+            if not (0 <= history_start <= history_end <= len(full_prompt_ids)):
+                raise ValueError(
+                    "PERSISTENT_HISTORY_SESSION_BOUNDARY_MISMATCH: "
+                    f"history_start={history_start}, history_end={history_end}, "
+                    f"previous_tokens={len(previous)}"
+                )
+            config["persistent_session"] = True
+            config["persistent_continuation"] = True
+            config["persistent_protected_prefix_tokens"] = history_start
+            config["persistent_delta_history_tokens"] = max(0, history_end - logical_prefix)
+            config["persistent_canonical_history_end"] = history_end
+            config["persistent_canonical_prompt_tokens"] = len(full_prompt_ids)
+        self._translate_tool_session_coordinates(request, logical_prefix, len(full_prompt_ids))
+        return delta, session_id, full_prompt_ids
+
+    @staticmethod
+    def _parity_hash(values: List[int]) -> str:
+        return hashlib.sha256(
+            ",".join(str(int(value)) for value in values).encode("ascii")
+        ).hexdigest()
+
+    def _attach_parity_debug(
+        self,
+        request: ChatCompletionRequest,
+        adapted_request: GenerateReqInput,
+        full_prompt_ids: Optional[List[int]],
+        input_ids: Optional[List[int]],
+    ) -> None:
+        hint = request.c2kv_kv_memory_hint
+        if not isinstance(hint, dict) or not hint.get("parity_debug"):
+            return
+        full, delta = list(full_prompt_ids or []), list(input_ids or [])
+        prefix_len = max(0, len(full) - len(delta))
+        template_messages = self._openai_messages_for_chat_template(
+            list(request.messages)
+        )
+        adapted_request._parity_debug = {
+            "prompt_ids_sha256": self._parity_hash(full),
+            "prompt_token_count": len(full),
+            "position_ids_sha256": self._parity_hash(list(range(len(full)))),
+            "position_token_count": len(full),
+            "cached_prefix_tokens": prefix_len,
+            "cached_prefix_ids_sha256": self._parity_hash(full[:prefix_len]),
+            "delta_tokens": len(delta),
+            "delta_ids_sha256": self._parity_hash(delta),
+            "canonical_reconstruction_matches": full[:prefix_len] + delta == full,
+            "request_model": request.model,
+            "chat_template_kwargs": copy.deepcopy(request.chat_template_kwargs or {}),
+            "reasoning_effort": request.reasoning_effort,
+            "tool_choice": (
+                request.tool_choice if isinstance(request.tool_choice, str)
+                else request.tool_choice.model_dump()
+            ),
+            "parallel_tool_calls": request.parallel_tool_calls,
+            "c2kv_tools_in_prompt": request.c2kv_tools_in_prompt,
+            "c2kv_tools_dump": getattr(
+                getattr(self.tokenizer_manager, "server_args", None),
+                "c2kv_tools_dump", None,
+            ),
+            "chat_template_tools_sha256": hashlib.sha256(
+                json.dumps(
+                    self._chat_template_tools(request) or [],
+                    ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            "chat_template_messages_sha256": hashlib.sha256(
+                json.dumps(
+                    template_messages,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            "jinja_template_content_format": (
+                self.template_manager.jinja_template_content_format
+            ),
+            "chat_template_name": self.template_manager.chat_template_name,
+            "prompt_ids_head": full[:32],
+            "prompt_ids_tail": full[-32:],
+            # Full IDs are intentionally debug-only. They make a one-request
+            # parity failure actionable without changing normal response size.
+            "prompt_ids": full,
+        }
+
+    def _translate_tool_session_coordinates(self, request, input_prefix, input_len):
+        """Keep token-prefix matching separate from the expanded source ledger."""
+        from sglang.srt.mem_cache.c2kv_composition import source_boundary
+
+        hint = request.c2kv_kv_memory_hint
+        segments = hint.get("tool_memory_segments") or []
+        session_id = (request.session_params or {}).get("id")
+        previous = getattr(self, "_persistent_history_tool_segments", {}).get(session_id, [])
+        if not segments and not previous:
+            return
+        old_prefix = [segment for segment in segments if segment["token_start"] < input_prefix]
+        source_digest = (hint.get("joint_tool_memory") or {}).get(
+            "source_protocol_token_sha256"
+        )
+        previous_digest = getattr(
+            self, "_persistent_history_tool_source_digests", {}
+        ).get(session_id)
+        if input_prefix and previous:
+            if source_digest and previous_digest and source_digest != previous_digest:
+                raise ValueError("PERSISTENT_HISTORY_TOOL_PREFIX_CHANGED")
+            if previous != old_prefix:
+                if not source_digest or source_digest != previous_digest:
+                    raise ValueError("PERSISTENT_HISTORY_TOOL_PREFIX_CHANGED")
+                frame_keys = ("token_start", "token_end", "source_tokens")
+                same_frame = len(previous) == len(old_prefix) == 1 and all(
+                    previous[0].get(key) == old_prefix[0].get(key)
+                    for key in frame_keys
+                )
+                if not same_frame:
+                    raise ValueError("PERSISTENT_HISTORY_TOOL_PREFIX_CHANGED")
+                hint["persistent_tool_refresh"] = {
+                    "source_protocol_token_sha256": source_digest,
+                    "previous_segment": dict(previous[0]),
+                    "new_segment": dict(old_prefix[0]),
+                }
+        elif previous != old_prefix and input_prefix:
+            raise ValueError("PERSISTENT_HISTORY_TOOL_PREFIX_CHANGED")
+        hint["tool_memory_input_prefix_tokens"] = input_prefix
+        for key in ("persistent_session_logical_prefix_tokens",
+                    "persistent_session_computed_prefix_tokens",
+                    "persistent_session_canonical_prompt_tokens"):
+            if key in hint:
+                applicable = segments if key == "persistent_session_canonical_prompt_tokens" else old_prefix
+                hint[key] = source_boundary(hint[key], applicable)
+        config = hint.get("history_kv_eviction")
+        if isinstance(config, dict):
+            for key in ("persistent_protected_prefix_tokens",
+                        "persistent_canonical_history_end",
+                        "persistent_canonical_prompt_tokens"):
+                if key in config:
+                    config[key] = source_boundary(config[key], segments)
+        for span in hint.get("history_kv_event_token_spans") or []:
+            for key in ("start", "end"):
+                span[key] = source_boundary(span[key], segments)
+        suffix_key = "history_kv_event_generation_suffix_start"
+        if suffix_key in hint:
+            hint[suffix_key] = source_boundary(hint[suffix_key], segments)
+        hint["tool_memory_canonical_prompt_tokens"] = source_boundary(input_len, segments)
+
+    def _commit_persistent_history_session(
+        self,
+        adapted_request: GenerateReqInput,
+        ret: List[Dict[str, Any]],
+    ) -> None:
+        session_id = getattr(adapted_request, "_persistent_history_session_id", None)
+        canonical_prompt_ids = getattr(
+            adapted_request, "_persistent_history_canonical_prompt_ids", None
+        )
+        if not session_id or not isinstance(canonical_prompt_ids, list) or not ret:
+            return
+        finish_reason = (ret[0].get("meta_info") or {}).get("finish_reason") or {}
+        if finish_reason.get("type") == "abort":
+            # A failed selector/injection request did not establish a valid
+            # continuation. Committing its canonical prompt makes a retry look
+            # like an empty next turn and masks the original failure with
+            # PERSISTENT_HISTORY_SELECTION_REQUIRES_NEW_QUERY.
+            return
+        output_ids = ret[0].get("output_ids") or []
+        if not isinstance(output_ids, list):
+            raise ValueError("PERSISTENT_HISTORY_SESSION_OUTPUT_IDS_MISSING")
+        hint = getattr(adapted_request, "c2kv_kv_memory_hint", None) or {}
+        if hint.get("tool_memory_segments"):
+            self._persistent_history_tool_segments[session_id] = [
+                dict(item) for item in hint["tool_memory_segments"]
+            ]
+            source_digest = (hint.get("joint_tool_memory") or {}).get(
+                "source_protocol_token_sha256"
+            )
+            if source_digest:
+                self._persistent_history_tool_source_digests[session_id] = source_digest
+        reference_config = hint.get("history_kv_reference_config") or {}
+        method = str(reference_config.get("method") or "").lower()
+        exact_output = method in {"agentkv", "commitkv"}
+        self._persistent_history_generation_bases[session_id] = list(
+            canonical_prompt_ids
+        )
+        if exact_output:
+            next_prefix = list(canonical_prompt_ids) + list(output_ids)
+            report = (ret[0].get("meta_info") or {}).get("kv_memory_report") or {}
+            from sglang.srt.mem_cache.c2kv_composition import (
+                source_boundary,
+                trailing_source_horizon_to_input,
+            )
+            segments = hint.get("tool_memory_segments") or []
+            source_prompt_len = source_boundary(len(canonical_prompt_ids), segments)
+            if source_prompt_len != int(
+                hint.get("persistent_session_canonical_prompt_tokens", source_prompt_len)
+            ):
+                raise ValueError("PERSISTENT_HISTORY_TOOL_SOURCE_PROMPT_MISMATCH")
+            computed_source_horizon = report.get(
+                "persistent_session_computed_logical_horizon"
+            )
+            if computed_source_horizon is None:
+                computed_source_horizon = source_prompt_len
+            computed_prefix = trailing_source_horizon_to_input(
+                computed_source_horizon, len(canonical_prompt_ids), segments
+            )
+            if not len(canonical_prompt_ids) <= computed_prefix <= len(next_prefix):
+                raise ValueError(
+                    "PERSISTENT_HISTORY_SESSION_COMPUTED_PREFIX_INVALID"
+                )
+            self._persistent_history_sessions[session_id] = next_prefix
+            self._persistent_history_computed_prefixes[session_id] = computed_prefix
+            report["persistent_session_computed_input_horizon"] = computed_prefix
+        else:
+            self._persistent_history_sessions[session_id] = list(canonical_prompt_ids)
+            self._persistent_history_computed_prefixes[session_id] = len(
+                canonical_prompt_ids
+            )
+        self._persistent_history_exact_output[session_id] = exact_output
+        generation_prefix_ids = getattr(
+            adapted_request, "_persistent_history_generation_prefix_ids", None
+        )
+        if generation_prefix_ids is not None:
+            self._persistent_history_generation_prefixes[session_id] = list(generation_prefix_ids)
+        ret[0].setdefault("meta_info", {})["persistent_history_session"] = {
+            "session_id": session_id,
+            "canonical_prompt_tokens": len(canonical_prompt_ids),
+            "generated_tokens": len(output_ids),
+            "next_prefix_tokens": len(self._persistent_history_sessions[session_id]),
+            "computed_prefix_tokens": self._persistent_history_computed_prefixes[
+                session_id
+            ],
+            "generated_suffix_reprefill_required": not exact_output,
+            "exact_output_prefix_required": exact_output,
+            "continuation_mode": (
+                "exact_generated_prefix" if exact_output else "canonical_reprefill"
+            ),
+            "generated_text": str(ret[0].get("text") or ""),
+            "generated_token_ids": list(output_ids),
+            "retokenization_reconciled": bool(
+                hint.get("persistent_session_retokenization_reconciled", False)
+            ),
+            "retokenization_token_shift": int(
+                hint.get("persistent_session_retokenization_token_shift", 0)
+            ),
+            "generation_prefix_tokens": len(generation_prefix_ids or []),
+            "recovery_append_supported": not exact_output,
+        }
+
+    def _handle_last_assistant_message(
+        self,
+        messages: List[Dict[str, Any]],
+        request: ChatCompletionRequest,
+    ) -> tuple[List[Dict[str, Any]], Optional[str]]:
+        """
+        Handle continue_final_message feature: separate final assistant message.
+
+        If continue_final_message is enabled and the last message is from assistant,
+        extract its content and remove it from the message list.
+        If continue_final_message is False and the last message is from assistant,
+        convert it to a user message to ensure the last message is always from user.
+
+        Only processes text-based content (strings), ignoring multimodal content (lists).
+
+        Args:
+            messages: List of message dictionaries
+            request: ChatCompletionRequest with continue_final_message flag
+
+        Returns:
+            Tuple of (processed_messages, assistant_prefix)
+            - processed_messages: Messages with last assistant message handled appropriately
+            - assistant_prefix: Content of the last assistant message (string only), or None
+        """
+        assistant_prefix = None
+        if messages and messages[-1].get("role") == "assistant":
+            last_content = messages[-1].get("content")
+            # Only process string content, ignore multimodal content (lists)
+            if isinstance(last_content, str):
+                if request.continue_final_message:
+                    # Extract content and remove the assistant message
+                    assistant_prefix = last_content
+                    messages = messages[:-1]
+                else:
+                    # Convert the last assistant message to user message
+                    messages[-1] = {"role": "user", "content": last_content}
+        return messages, assistant_prefix
+
+    def _append_assistant_prefix_to_prompt_ids(
+        self, prompt_ids: List[int], assistant_prefix: str
+    ) -> List[int]:
+        """
+        Append assistant prefix to prompt_ids.
+
+        Args:
+            prompt_ids: Current prompt token IDs
+            assistant_prefix: Assistant message content to append
+
+        Returns:
+            Updated prompt_ids with assistant prefix appended
+        """
+        encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
+        if encoded and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id:
+            encoded = encoded[1:]
+        return prompt_ids + encoded
+
+    def _use_dpsk_v32_encoding(self) -> bool:
+        has_chat_template = (
+            self.tokenizer_manager.tokenizer is not None
+            and self.tokenizer_manager.tokenizer.chat_template is not None
+        )
+        architectures = self.tokenizer_manager.model_config.hf_config.architectures
+        is_dpsk_v32 = "DeepseekV3" in architectures[0] if architectures else False
+        return not has_chat_template and is_dpsk_v32
+
+    def _request_id_prefix(self) -> str:
+        return "chatcmpl-"
+
+    def _validate_request(self, request: ChatCompletionRequest) -> Optional[str]:
+        """Validate that the input is valid."""
+        if not request.messages:
+            return "Messages cannot be empty."
+
+        if (
+            isinstance(request.tool_choice, str)
+            and request.tool_choice.lower() == "required"
+            and not request.tools
+        ):
+            return "Tools cannot be empty if tool choice is set to required."
+
+        if request.tool_choice is not None and not isinstance(request.tool_choice, str):
+            if not request.tools:
+                return "Tools cannot be empty if tool choice is set to a specific tool."
+            tool_name = request.tool_choice.function.name
+            tool_exists = any(tool.function.name == tool_name for tool in request.tools)
+            if not tool_exists:
+                return f"Tool '{tool_name}' not found in tools list."
+
+        # Validate tool definitions
+        for i, tool in enumerate(request.tools or []):
+            if tool.function.parameters is None:
+                continue
+            try:
+                Draft202012Validator.check_schema(tool.function.parameters)
+            except SchemaError as e:
+                return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
+
+        max_output_tokens = request.max_completion_tokens or request.max_tokens
+        server_context_length = self.tokenizer_manager.server_args.context_length
+        if (
+            max_output_tokens
+            and server_context_length
+            and max_output_tokens > server_context_length
+        ) and not self.tokenizer_manager.server_args.allow_auto_truncate:
+            return (
+                f"max_completion_tokens is too large: {max_output_tokens}."
+                f"This model supports at most {server_context_length} completion tokens."
+            )
+
+        if request.response_format and request.response_format.type == "json_schema":
+            schema = getattr(request.response_format.json_schema, "schema_", None)
+            if schema is None:
+                return "schema_ is required for json_schema response format request."
+
+        return None
+
+    def _c2kv_tools_dump_exclude_unset(self) -> bool:
+        """Whether tool schemas are serialized with `exclude_unset=True`.
+
+        `--c2kv-tools-dump full` (the default) reproduces plain `model_dump()`,
+        i.e. the tool prologue this server rendered before 2026-09-05 (pydantic
+        defaults such as `"strict": false` included, +4 tokens per tool with the
+        Qwen3 template). `exclude_unset` renders the client's tool JSON verbatim,
+        which is what a client that predicts C2KV insertion points or repair
+        positions itself needs. The value also drives
+        `http_server._c2kv_template_ids`, so the chat frame and the repair frame
+        agree. Changing the flag changes the served prompt; see
+        c2kv/c2kv_serving_semantics.md.
+        """
+        server_args = getattr(self.tokenizer_manager, "server_args", None)
+        return getattr(server_args, "c2kv_tools_dump", "full") == "exclude_unset"
+
+    def _chat_template_tools(
+        self, request: "ChatCompletionRequest"
+    ) -> Optional[List[Dict]]:
+        if not request.tools or request.tool_choice == "none":
+            return None
+        if getattr(request, "c2kv_tools_in_prompt", None) is False:
+            # C2KV tool memory: the client renders its own explicit tool
+            # protocol and supplies the schemas as gist segments; the served
+            # prompt must not carry a second copy.  Every token frame this
+            # class measures (segments, history span, repair offsets) goes
+            # through this one accessor, so all of them agree.
+            return None
+        exclude_unset = self._c2kv_tools_dump_exclude_unset()
+        if not isinstance(request.tool_choice, str):
+            return chat_template_tools_dump(
+                [
+                    item
+                    for item in request.tools
+                    if item.function.name == request.tool_choice.function.name
+                ],
+                exclude_unset=exclude_unset,
+            )
+        return chat_template_tools_dump(request.tools, exclude_unset=exclude_unset)
+
+    def _chat_template_extra_kwargs(
+        self, request: "ChatCompletionRequest"
+    ) -> Dict[str, Any]:
+        extra_template_kwargs = {}
+        if request.reasoning_effort is not None:
+            extra_template_kwargs["reasoning_effort"] = request.reasoning_effort
+        if request.chat_template_kwargs:
+            extra_template_kwargs.update(request.chat_template_kwargs)
+        return extra_template_kwargs
+
+    def _openai_messages_for_chat_template(self, messages: List[ChatMessage]):
+        template_content_format = self.template_manager.jinja_template_content_format
+        openai_compatible_messages = []
+        image_data = []
+        video_data = []
+        audio_data = []
+        modalities = []
+
+        for message in messages:
+            msg_dict = message.model_dump()
+            if msg_dict.get("content") is None:
+                msg_dict["content"] = ""
+            processed_msg = process_content_for_template_format(
+                msg_dict,
+                template_content_format,
+                image_data,
+                video_data,
+                audio_data,
+                modalities,
+            )
+            if (
+                processed_msg["role"] == "assistant"
+                and "tool_calls" in processed_msg
+                and isinstance(processed_msg["tool_calls"], list)
+            ):
+                for item in processed_msg["tool_calls"]:
+                    if "arguments" in item["function"] and isinstance(
+                        item["function"]["arguments"], str
+                    ):
+                        item["function"]["arguments"] = orjson.loads(
+                            item["function"]["arguments"]
+                        )
+            openai_compatible_messages.append(processed_msg)
+
+        return openai_compatible_messages
+
+    def _c2kv_chat_template_input_ids(
+        self,
+        request: "ChatCompletionRequest",
+        messages: List[ChatMessage],
+        tools: Optional[List[Dict]],
+    ):
+        if not messages:
+            return []
+
+        tokenizer = self.tokenizer_manager.tokenizer
+        extra_template_kwargs = self._chat_template_extra_kwargs(request)
+        openai_compatible_messages = self._openai_messages_for_chat_template(messages)
+
+        try:
+            tokenized = tokenizer.apply_chat_template(
+                openai_compatible_messages,
+                tokenize=True,
+                add_generation_prompt=False,
+                tools=tools,
+                return_dict=False,
+                **extra_template_kwargs,
+            )
+        except Exception:
+            # Match _apply_jinja_template's function-only fallback for templates
+            # that do not accept OpenAI's {"type": "function", ...} wrapper.
+            flat_tools = (
+                [t["function"] if "function" in t else t for t in tools]
+                if tools
+                else None
+            )
+            try:
+                tokenized = tokenizer.apply_chat_template(
+                    openai_compatible_messages,
+                    tokenize=True,
+                    add_generation_prompt=False,
+                    tools=flat_tools,
+                    return_dict=False,
+                    **extra_template_kwargs,
+                )
+            except jinja2.TemplateError as template_error:
+                raise ValueError(str(template_error)) from template_error
+
+        if hasattr(tokenized, "input_ids"):
+            tokenized = tokenized.input_ids
+        elif isinstance(tokenized, dict):
+            tokenized = tokenized["input_ids"]
+        return list(tokenized)
+
+    def _c2kv_first_message_start_offset(
+        self,
+        request: "ChatCompletionRequest",
+        msg: ChatMessage,
+        tools: Optional[List[Dict]],
+    ) -> int:
+        """Return where the first real chat message starts after tool prologue.
+
+        Qwen-style templates render `tools=` before the first user/assistant
+        message.  A C2KV/repair segment at the beginning of the message list
+        must therefore be injected after that prologue, not at token offset 0.
+        """
+
+        with_tools = self._c2kv_chat_template_input_ids(request, [msg], tools)
+        without_tools = self._c2kv_chat_template_input_ids(request, [msg], None)
+
+        bos_id = getattr(self.tokenizer_manager.tokenizer, "bos_token_id", None)
+        while without_tools and bos_id is not None and without_tools[0] == bos_id:
+            without_tools = without_tools[1:]
+
+        if not without_tools:
+            return 0
+
+        limit = len(with_tools) - len(without_tools) + 1
+        for start in range(max(0, limit)):
+            if with_tools[start : start + len(without_tools)] == without_tools:
+                return start
+
+        if len(with_tools) >= len(without_tools) and with_tools[-len(without_tools) :] == without_tools:
+            return len(with_tools) - len(without_tools)
+
+        logger.warning(
+            "C2KV could not locate first message inside chat template with tools; "
+            "falling back to offset 0. with_tools_len=%s, without_tools_len=%s",
+            len(with_tools),
+            len(without_tools),
+        )
+        return 0
+
+    def _c2kv_tool_definition_span(
+        self,
+        request: "ChatCompletionRequest",
+        messages: List[ChatMessage],
+        tools: List[Dict],
+        prompt_ids: List[int],
+    ) -> tuple[int, int]:
+        """Locate only the serialized tool schemas in the native prompt.
+
+        Comparing a prompt with tools to one without tools is not a valid
+        boundary operation for Qwen: enabling tools changes the surrounding
+        system-message scaffold as well.  Render a sentinel tool through the
+        *same tools branch* instead.  The common prefix/suffix then protects
+        the system scaffold, tool instructions, messages, and current turn;
+        only the request-specific serialized definitions remain variable.
+        """
+
+        sentinel_tools = [{
+            "type": "function",
+            "function": {
+                "name": "__c2kv_tool_span_sentinel__",
+                "description": "__c2kv_tool_span_sentinel_description__",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "__c2kv_tool_span_sentinel_argument__": {
+                            "type": "string"
+                        }
+                    },
+                },
+            },
+        }]
+        sentinel_ids = self._c2kv_chat_template_input_ids(
+            request, messages, sentinel_tools)
+
+        left = 0
+        common = min(len(prompt_ids), len(sentinel_ids))
+        while left < common and prompt_ids[left] == sentinel_ids[left]:
+            left += 1
+        right = 0
+        while (right < len(prompt_ids) - left
+               and right < len(sentinel_ids) - left
+               and prompt_ids[-1 - right] == sentinel_ids[-1 - right]):
+            right += 1
+        tool_end = len(prompt_ids) - right
+        if not left < tool_end:
+            raise ValueError("JOINT_KV_TOOL_SCOPE_EMPTY_AFTER_SENTINEL_DIFF")
+
+        # Qwen encloses the complete serialized definitions in native
+        # <tools>...</tools> markers.  Expand the variable core found above to
+        # those renderer-owned boundaries so common JSON keys/braces are also
+        # compressed.  Keep the sentinel interval as a template-agnostic
+        # fallback for other native templates.
+        tokenizer = self.tokenizer_manager.tokenizer
+        try:
+            # Exclude the closing '>' because Qwen's tokenizer merges it with
+            # the following newline in-context (``'>\\n'`` / ``'>\\n\\n'``).
+            # The marker stems remain exact token subsequences.
+            open_marker = list(tokenizer.encode(
+                "<tools", add_special_tokens=False))
+            close_marker = list(tokenizer.encode(
+                "</tools", add_special_tokens=False))
+        except (AttributeError, TypeError):
+            open_marker = close_marker = []
+
+        def occurrences(needle: List[int]) -> List[int]:
+            if not needle:
+                return []
+            return [
+                start for start in range(len(prompt_ids) - len(needle) + 1)
+                if prompt_ids[start:start + len(needle)] == needle
+            ]
+
+        opening_ends = [
+            start + len(open_marker) for start in occurrences(open_marker)
+            if start + len(open_marker) <= left
+        ]
+        # prompt_ids is the final generation prompt, while the auxiliary
+        # renderer above deliberately uses add_generation_prompt=False.  A
+        # reverse common-suffix diff can therefore end at the very end of the
+        # final prompt.  Pair the selected native opening marker with the
+        # first native closing marker after it; do not use that provisional
+        # diff end to search for </tools>.
+        bracketed_start = max(opening_ends) if opening_ends else None
+        closing_starts = (
+            [start for start in occurrences(close_marker)
+             if start >= bracketed_start]
+            if bracketed_start is not None else []
+        )
+        if bracketed_start is not None and closing_starts:
+            bracketed_end = min(closing_starts)
+            if bracketed_start < bracketed_end:
+                left, tool_end = bracketed_start, bracketed_end
+        return left, tool_end
+
+    def _c2kv_per_tool_definition_scopes(
+        self,
+        request: "ChatCompletionRequest",
+        messages: List[ChatMessage],
+        tools: List[Dict],
+        prompt_ids: List[int],
+        retention_ratio: float,
+        compression_enabled: bool,
+    ) -> List[Dict]:
+        """Partition the native ``<tools>`` payload at tool boundaries.
+
+        Each boundary is derived from the longest common token prefix between
+        the final prompt and the same server-side chat template rendered with
+        the first N tools. This keeps all offsets in the authoritative server
+        tokenizer frame and leaves protocol/scaffold tokens untouched.
+        """
+
+        tool_start, tool_end = self._c2kv_tool_definition_span(
+            request, messages, tools, prompt_ids
+        )
+        # Tool schemas live in the renderer-owned prelude, before ordinary
+        # messages. Keep one message to select the same chat-template branch
+        # without re-rendering an arbitrarily long completed history for every
+        # tool boundary. The LCP against ``prompt_ids`` still validates that
+        # every boundary belongs to the final authoritative token frame.
+        boundary_messages = messages[:1]
+        boundaries: List[int] = []
+        previous = tool_start
+        for count in range(1, len(tools)):
+            prefix_ids = self._c2kv_chat_template_input_ids(
+                request, boundary_messages, tools[:count]
+            )
+            common = 0
+            limit = min(len(prompt_ids), len(prefix_ids), tool_end)
+            while common < limit and prompt_ids[common] == prefix_ids[common]:
+                common += 1
+            if not previous < common < tool_end:
+                raise ValueError(
+                    "JOINT_KV_PER_TOOL_BOUNDARY_UNRESOLVED: "
+                    f"tool={count - 1}, previous={previous}, "
+                    f"boundary={common}, tool_end={tool_end}"
+                )
+            boundaries.append(common)
+            previous = common
+        boundaries.append(tool_end)
+
+        scopes: List[Dict] = []
+        start = tool_start
+        for index, end in enumerate(boundaries):
+            full_tokens = end - start
+            scopes.append({
+                "kind": "tool",
+                "unit_id": f"tool:{index}",
+                "start": start,
+                "end": end,
+                "target_tokens": max(
+                    1, int(math.ceil(full_tokens * retention_ratio))
+                ),
+                "retention_ratio": retention_ratio,
+                "compression_enabled": compression_enabled,
+                "boundary_source": (
+                    "native_chat_template_per_tool_prefix_partition"
+                ),
+            })
+            start = end
+        if len(scopes) != len(tools) or start != tool_end:
+            raise ValueError("JOINT_KV_PER_TOOL_SCOPE_PARTITION_INVALID")
+        return scopes
+
+    def _compute_c2kv_segments(self, request: "ChatCompletionRequest"):
+        """
+        Detect messages annotated with c2kv_key_hash or repair-only KV keys,
+        compute their insertion points in the compressed prompt after annotated
+        messages are removed, remove them from the request so _process_messages
+        skips them, and return a list of C2KVSegmentInfo descriptors. Returns
+        None if no annotations found.
+        """
+        from sglang.srt.managers.io_struct import C2KVSegmentInfo
+
+        annotated = [
+            i
+            for i, m in enumerate(request.messages)
+            if getattr(m, "c2kv_key_hash", None)
+            or getattr(m, "c2kv_repair_key_hashes", None)
+            or getattr(m, "c2kv_repair_only_key_hashes", None)
+        ]
+        if not annotated:
+            return None
+
+        annotated_set = set(annotated)
+        tools = self._chat_template_tools(request)
+
+        segments = []
+        for i in annotated:
+            msg = request.messages[i]
+            explicit_repair_start = getattr(msg, "c2kv_repair_token_start", None)
+            if explicit_repair_start is not None:
+                insertion_point = int(explicit_repair_start)
+                if insertion_point < 0:
+                    raise ValueError(
+                        f"c2kv_repair_token_start must be non-negative, got {insertion_point}"
+                    )
+            else:
+                compressed_prefix = [
+                    m
+                    for j, m in enumerate(request.messages[:i])
+                    if j not in annotated_set
+                ]
+                if compressed_prefix:
+                    insertion_point = len(
+                        self._c2kv_chat_template_input_ids(
+                            request, compressed_prefix, tools
+                        )
+                    )
+                else:
+                    insertion_point = self._c2kv_first_message_start_offset(
+                        request, msg, tools
+                    )
+
+            segments.append(
+                C2KVSegmentInfo(
+                    key_hash=getattr(msg, "c2kv_key_hash", "") or "",
+                    token_start=insertion_point,
+                    token_end=insertion_point,
+                    repair_key_hashes=(
+                        list(getattr(msg, "c2kv_repair_key_hashes", None) or [])
+                        + list(
+                            getattr(msg, "c2kv_repair_only_key_hashes", None) or []
+                        )
+                    ),
+                    # Tri-state, forwarded VERBATIM: None means "unset", and
+                    # the scheduler then falls back to --c2kv-query-proj.
+                    # Collapsing it to a bool here would make "no field sent"
+                    # indistinguishable from "sent False" (D1).
+                    use_gist_projection=getattr(
+                        msg, "c2kv_use_gist_projection", None
+                    ),
+                    repair_placement=getattr(msg, "c2kv_repair_placement", None),
+                    region=getattr(msg, "c2kv_region", None),
+                    source_token_count=getattr(msg, "c2kv_source_token_count", None),
+                    source_token_end=getattr(msg, "c2kv_source_token_end", None),
+                )
+            )
+
+        tool_segments = [segment for segment in segments if segment.region == "tool"]
+        if tool_segments:
+            from sglang.srt.mem_cache.c2kv_composition import remap_message_metadata
+
+            hint = request.c2kv_kv_memory_hint
+            if not isinstance(hint, dict):
+                hint = request.c2kv_kv_memory_hint = {}
+            remap_message_metadata(hint, annotated, len(request.messages))
+            for segment in tool_segments:
+                if segment.source_token_count is None or segment.source_token_count <= 0:
+                    raise ValueError("C2KV_TOOL_SOURCE_TOKEN_COUNT_REQUIRED")
+            hint["tool_memory_segments"] = [
+                {"token_start": segment.token_start, "token_end": segment.token_end,
+                 "source_tokens": segment.source_token_count,
+                 "key_hash": segment.key_hash,
+                 "repair_key_hashes": list(segment.repair_key_hashes)}
+                for segment in tool_segments
+            ]
+
+        # Remove annotated messages so _process_messages omits their tokens from
+        # origin_input_ids; the gist injection fills each insertion point at
+        # inference time.
+        for i in reversed(annotated):
+            request.messages.pop(i)
+
+        return segments
+
+    @staticmethod
+    def _find_token_subsequence(haystack: List[int], needle: List[int]) -> int:
+        if not needle or len(needle) > len(haystack):
+            return -1
+        limit = len(haystack) - len(needle) + 1
+        for start in range(limit):
+            if haystack[start : start + len(needle)] == needle:
+                return start
+        return -1
+
+    def _resolve_history_kv_eviction_range(
+        self,
+        request: "ChatCompletionRequest",
+        prompt_ids: List[int],
+    ) -> None:
+        """Resolve BFCL history offsets in the server's actual token frame.
+
+        The client sends a completed-message count, never client-side token
+        offsets. Tool templates can produce a different prologue or fallback
+        representation on the server, so only the final OpenAI prompt IDs are
+        authoritative for physical KV eviction.
+        """
+
+        hint = request.c2kv_kv_memory_hint
+        if not isinstance(hint, dict):
+            return
+        config = hint.get("history_kv_eviction")
+        if not isinstance(config, dict):
+            return
+        compress_tools = bool(config.get("compress_tools", False))
+        compress_history = bool(
+            config.get("compress_completed_history", True))
+        joint_scope_mode = bool(config.get("joint_scope_mode", False))
+        scopes = []
+        tools = self._chat_template_tools(request)
+
+        # Tool boundaries come from the same server-owned Qwen renderer as
+        # the final request.  Keep the renderer in its tools branch and vary
+        # only the definitions; a with-tools/without-tools diff also includes
+        # Qwen's changed system scaffold and is therefore invalid here.
+        if compress_tools or joint_scope_mode:
+            if not tools:
+                raise ValueError("JOINT_KV_TOOL_SCOPE_REQUIRES_REQUEST_TOOLS")
+            tool_ratio = (
+                float(config.get("tool_retention_ratio") or 0.0)
+                if compress_tools else 1.0
+            )
+            if not 0.0 < tool_ratio <= 1.0:
+                raise ValueError(
+                    f"Invalid Tool KV retention ratio: {tool_ratio!r}")
+            scopes.extend(self._c2kv_per_tool_definition_scopes(
+                request, list(request.messages), tools, prompt_ids,
+                tool_ratio, compress_tools
+            ))
+
+        count = config.get("history_message_count")
+        if not compress_history and not joint_scope_mode:
+            count = None
+        if count is None:
+            if not scopes:
+                return
+            config["semantic_scopes"] = scopes
+            # SessionAwareCache remaps canonical prompt coordinates onto the
+            # compacted resident layout on every persistent continuation.
+            config["persistent_canonical_scopes"] = [
+                dict(scope) for scope in scopes
+            ]
+            config["history_start"] = min(s["start"] for s in scopes)
+            config["history_end"] = max(s["end"] for s in scopes)
+            config["joint_canonical_prompt_tokens"] = len(prompt_ids)
+            config["joint_current_full_tokens"] = max(
+                0, len(prompt_ids) - int(config["history_end"]))
+            config["target_tokens"] = sum(s["target_tokens"] for s in scopes)
+            hint["full_equivalent_tool_tokens"] = sum(
+                s["end"] - s["start"] for s in scopes if s["kind"] == "tool")
+            hint["full_equivalent_history_tokens"] = 0
+            return
+        try:
+            count = int(count)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid history_message_count: {count!r}") from exc
+        if not (0 < count <= len(request.messages)):
+            raise ValueError(
+                "Invalid physical history message boundary: "
+                f"history_message_count={count}, messages={len(request.messages)}"
+            )
+
+        start_count = config.get("history_start_message_count", 0)
+        try:
+            start_count = int(start_count)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid history_start_message_count: {start_count!r}"
+            ) from exc
+        if not (0 <= start_count < count):
+            raise ValueError(
+                "Invalid physical history start boundary: "
+                f"history_start_message_count={start_count}, "
+                f"history_message_count={count}"
+            )
+
+        tools = self._chat_template_tools(request)
+        completed = list(request.messages[:count])
+        protected = list(request.messages[:start_count])
+        completed_ids = self._c2kv_chat_template_input_ids(
+            request, completed, tools
+        )
+        if not completed_ids:
+            raise ValueError("Cannot resolve an empty completed-history prefix")
+
+        prefix_start = 0
+        if prompt_ids[: len(completed_ids)] != completed_ids:
+            prefix_start = self._find_token_subsequence(prompt_ids, completed_ids)
+        if prefix_start < 0:
+            raise ValueError(
+                "Server chat template prefix is not present in the final prompt; "
+                "refusing physical history KV eviction."
+            )
+        if protected:
+            protected_ids = self._c2kv_chat_template_input_ids(
+                request, protected, tools
+            )
+            if completed_ids[: len(protected_ids)] != protected_ids:
+                raise ValueError(
+                    "Protected system/tool prefix is not a prefix of completed "
+                    "history in the server chat template; refusing physical "
+                    "history KV eviction."
+                )
+            history_relative_start = len(protected_ids)
+        else:
+            history_relative_start = self._c2kv_first_message_start_offset(
+                request, completed[0], tools
+            )
+        history_start = prefix_start + history_relative_start
+        history_end = prefix_start + len(completed_ids)
+        if not (history_start < history_end <= len(prompt_ids)):
+            raise ValueError(
+                "Resolved physical history range is empty/outside the server prompt: "
+                f"start={history_start}, end={history_end}, prompt={len(prompt_ids)}"
+            )
+        span_tokens = history_end - history_start
+        if not compress_history:
+            target_tokens = span_tokens
+            target_source = "uncompressed_scope_accounting"
+        elif config.get("target_tokens") is None:
+            ratio = config.get("retention_ratio")
+            try:
+                ratio = float(ratio)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "Physical history KV eviction requires target_tokens or "
+                    "retention_ratio"
+                ) from exc
+            if not 0.0 < ratio <= 1.0:
+                raise ValueError(
+                    f"Invalid physical history retention_ratio: {ratio!r}"
+                )
+            target_tokens = max(
+                1, min(span_tokens, int(math.ceil(span_tokens * ratio)))
+            )
+            target_source = "server_tokenized_retention_ratio"
+        else:
+            target_tokens = max(
+                1, min(span_tokens, int(config["target_tokens"]))
+            )
+            target_source = "absolute_request_budget"
+        config["history_start"] = history_start
+        config["history_end"] = history_end
+        config["target_tokens"] = target_tokens
+        config["target_tokens_source"] = target_source
+        config["server_tokenized"] = True
+        # The server owns the final chat template, so this is the only exact
+        # full-history token count used by persistent physical accounting.
+        hint["full_equivalent_history_tokens"] = span_tokens
+        if scopes or joint_scope_mode:
+            scopes.append({
+                "kind": "history", "start": history_start, "end": history_end,
+                "target_tokens": target_tokens,
+                "retention_ratio": (
+                    config.get("retention_ratio") if compress_history else 1.0),
+                "compression_enabled": compress_history,
+                "boundary_source": "native_chat_template_message_prefix",
+            })
+            ordered_scopes = sorted(scopes, key=lambda scope: int(scope["start"]))
+            for previous, current in zip(ordered_scopes, ordered_scopes[1:]):
+                if int(previous["end"]) > int(current["start"]):
+                    raise ValueError(
+                        "JOINT_KV_OVERLAPPING_CANONICAL_SCOPES: "
+                        f"{previous['kind']}=[{previous['start']},{previous['end']}), "
+                        f"{current['kind']}=[{current['start']},{current['end']})"
+                    )
+            config["semantic_scopes"] = ordered_scopes
+            config["persistent_canonical_scopes"] = [
+                dict(scope) for scope in ordered_scopes
+            ]
+            config["history_start"] = min(s["start"] for s in ordered_scopes)
+            config["history_end"] = max(s["end"] for s in ordered_scopes)
+            config["joint_canonical_prompt_tokens"] = len(prompt_ids)
+            config["joint_current_full_tokens"] = max(
+                0, len(prompt_ids) - int(config["history_end"])
+            )
+            config["target_tokens"] = sum(s["target_tokens"] for s in ordered_scopes)
+            hint["full_equivalent_tool_tokens"] = sum(
+                s["end"] - s["start"] for s in ordered_scopes if s["kind"] == "tool"
+            )
+
+    def _resolve_tool_kv_schema_spans(
+        self,
+        request: "ChatCompletionRequest",
+        prompt_ids: List[int],
+    ) -> None:
+        hint = request.c2kv_kv_memory_hint
+        config = hint.get("tool_kv_eviction") if isinstance(hint, dict) else None
+        if not isinstance(config, dict):
+            return
+        if request.c2kv_tools_in_prompt is not False:
+            raise ValueError("TOOL_KV_REQUIRES_EXPLICIT_PROTOCOL")
+        if self.template_manager.chat_template_name is not None or self.use_dpsk_v32_encoding:
+            raise ValueError("TOOL_KV_REQUIRES_JINJA_TEXT_TEMPLATE")
+        if getattr(request, "continue_final_message", False):
+            raise ValueError("TOOL_KV_CONTINUE_FINAL_MESSAGE_UNSUPPORTED")
+        tokenizer = self.tokenizer_manager.tokenizer
+        messages = self._openai_messages_for_chat_template(list(request.messages))
+        rendered = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            tools=None,
+            **self._chat_template_extra_kwargs(request),
+        )
+        from sglang.srt.mem_cache.tool_kv_spans import resolve_schema_token_spans
+
+        config["resolved_schema_token_spans"] = resolve_schema_token_spans(
+            rendered_prompt=rendered,
+            prompt_ids=prompt_ids,
+            message_contents=[item.get("content") for item in messages],
+            schema_spans=config.get("schema_spans") or [],
+            tokenizer=tokenizer,
+        )
+        protocol_span = config.get("tool_protocol_span")
+        if protocol_span is not None:
+            resolved = resolve_schema_token_spans(
+                rendered_prompt=rendered,
+                prompt_ids=prompt_ids,
+                message_contents=[item.get("content") for item in messages],
+                schema_spans=[{"schema_index": -1, **protocol_span}],
+                tokenizer=tokenizer,
+                boundary_policy="overlap",
+            )
+            config["resolved_tool_protocol_token_span"] = resolved[0]
+        interface_spans = config.get("protected_interface_spans") or []
+        if interface_spans:
+            resolved_interface = []
+            for index, span in enumerate(interface_spans):
+                # Resolve independently: adjacent interface fields may share a
+                # boundary-crossing BPE token, which is protected by both.
+                resolved_interface.extend(resolve_schema_token_spans(
+                    rendered_prompt=rendered,
+                    prompt_ids=prompt_ids,
+                    message_contents=[item.get("content") for item in messages],
+                    schema_spans=[{"schema_index": -2 - index, **span}],
+                    tokenizer=tokenizer,
+                    boundary_policy="overlap",
+                ))
+            config["resolved_protected_interface_token_spans"] = resolved_interface
+        config["server_tokenized"] = True
+        config["full_prompt_tokens"] = len(prompt_ids)
+
+    def _resolve_history_kv_event_token_spans(
+        self,
+        request: "ChatCompletionRequest",
+        prompt_ids: List[int],
+    ) -> None:
+        """Resolve proxy message events into server-tokenized canonical spans."""
+
+        hint = request.c2kv_kv_memory_hint
+        if not isinstance(hint, dict):
+            return
+        events = hint.get("history_kv_event_messages")
+        if events is None:
+            return
+        if not isinstance(events, list) or len(events) != len(request.messages):
+            raise ValueError(
+                "history_kv_event_messages must align one-to-one with "
+                "assembled request messages"
+            )
+        tools = self._chat_template_tools(request)
+        prefix_ids = []
+        for end in range(1, len(request.messages) + 1):
+            ids = self._c2kv_chat_template_input_ids(
+                request, list(request.messages[:end]), tools
+            )
+            if len(ids) > len(prompt_ids) or prompt_ids[: len(ids)] != ids:
+                raise ValueError(
+                    "HISTORY_KV_EVENT_TEMPLATE_PREFIX_MISMATCH: "
+                    f"message_index={end - 1}, prefix_tokens={len(ids)}, "
+                    f"prompt_tokens={len(prompt_ids)}"
+                )
+            prefix_ids.append(ids)
+        from sglang.srt.mem_cache.history_kv_events import (
+            resolve_history_kv_event_token_spans,
+        )
+
+        first_start = self._c2kv_first_message_start_offset(
+            request, request.messages[0], tools
+        )
+        completed_end = len(prefix_ids[-1])
+        spans = resolve_history_kv_event_token_spans(
+            total_tokens=completed_end,
+            message_prefix_token_counts=[first_start]
+            + [len(item) for item in prefix_ids],
+            event_messages=events,
+        )
+        # The final prompt may append an assistant-generation scaffold.  It is
+        # intentionally outside every completed-message event span.
+        hint["history_kv_event_token_spans"] = spans
+        hint["history_kv_event_generation_suffix_start"] = completed_end
+        reference_config = hint.get("history_kv_reference_config")
+        if isinstance(reference_config, dict) and str(
+            reference_config.get("method") or ""
+        ).lower() == "agentkv":
+            tokenizer = self.tokenizer_manager.tokenizer
+            marker_stages = {
+                "<think>": 1,
+                "</think>": 1,
+                "<tool_call>": 2,
+                "</tool_call>": 2,
+            }
+            resolved_markers = []
+            for marker, stage in marker_stages.items():
+                token_ids = tokenizer.encode(
+                    marker, add_special_tokens=False
+                )
+                if token_ids:
+                    resolved_markers.append(
+                        {"token_ids": list(token_ids), "stage": stage}
+                    )
+            reference_config["agentkv_marker_stage_sequences"] = resolved_markers
+
+    def _resolve_paper_history_token_count(
+        self,
+        request: "ChatCompletionRequest",
+        prompt_ids: List[int],
+    ) -> Optional[int]:
+        """Resolve the common history denominator in the server token frame."""
+
+        hint = request.c2kv_kv_memory_hint
+        config = hint.get("paper_measurement") if isinstance(hint, dict) else None
+        if not isinstance(config, dict):
+            return None
+        count = config.get("history_message_count")
+        start_count = config.get("history_start_message_count", 0)
+        try:
+            count = int(count)
+            start_count = int(start_count)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Invalid paper measurement history boundary") from exc
+        if count == 0 and start_count == 0:
+            config.update(
+                history_start=0,
+                history_end=0,
+                history_full_kv_tokens=0,
+                server_tokenized=True,
+            )
+            return 0
+        if not (0 <= start_count < count <= len(request.messages)):
+            raise ValueError(
+                "Invalid paper measurement history boundary: "
+                f"start={start_count}, end={count}, messages={len(request.messages)}"
+            )
+        tools = self._chat_template_tools(request)
+        completed = list(request.messages[:count])
+        protected = list(request.messages[:start_count])
+        completed_ids = self._c2kv_chat_template_input_ids(request, completed, tools)
+        prefix_start = 0
+        if prompt_ids[: len(completed_ids)] != completed_ids:
+            prefix_start = self._find_token_subsequence(prompt_ids, completed_ids)
+        if prefix_start < 0:
+            raise ValueError(
+                "Paper measurement history prefix is absent from the final prompt"
+            )
+        if protected:
+            protected_ids = self._c2kv_chat_template_input_ids(
+                request, protected, tools
+            )
+            if completed_ids[: len(protected_ids)] != protected_ids:
+                raise ValueError(
+                    "Paper measurement protected prefix is not a history prefix"
+                )
+            relative_start = len(protected_ids)
+        else:
+            relative_start = self._c2kv_first_message_start_offset(
+                request, completed[0], tools
+            )
+        history_start = prefix_start + relative_start
+        history_end = prefix_start + len(completed_ids)
+        if not (history_start < history_end <= len(prompt_ids)):
+            raise ValueError("Paper measurement history range is empty or invalid")
+        config.update(
+            history_start=history_start,
+            history_end=history_end,
+            history_full_kv_tokens=history_end - history_start,
+            server_tokenized=True,
+        )
+        return history_end - history_start
+
+    @staticmethod
+    def _paper_source_request(request, measurement_config):
+        """Validate the original source solely for denominator tokenization."""
+        messages = measurement_config.get("canonical_source_messages")
+        tools = measurement_config.get("canonical_source_tools")
+        if not isinstance(messages, list) or not isinstance(tools, list):
+            raise ValueError("C2KV_PAPER_CANONICAL_SOURCE_MESSAGES_AND_TOOLS_REQUIRED")
+        payload = request.model_dump()
+        payload.update(messages=copy.deepcopy(messages), tools=copy.deepcopy(tools))
+        return type(request).model_validate(payload)
+
+    @staticmethod
+    def _paper_history_request(request):
+        """Exclude transport carriers from the independent history denominator."""
+        result = copy.deepcopy(request)
+        removed = [index for index, message in enumerate(result.messages)
+                   if getattr(message, "c2kv_region", None) == "tool"
+                   and (getattr(message, "c2kv_key_hash", None)
+                        or getattr(message, "c2kv_repair_only_key_hashes", None)
+                        or getattr(message, "c2kv_repair_key_hashes", None))]
+        if removed:
+            measurement = result.c2kv_kv_memory_hint["paper_measurement"]
+            for key in ("history_start_message_count", "history_message_count"):
+                if key in measurement:
+                    count = int(measurement[key])
+                    measurement[key] = count - sum(index < count for index in removed)
+            result.messages = [message for index, message in enumerate(result.messages) if index not in removed]
+        return result
+
+    def _convert_to_internal_request(
+        self,
+        request: ChatCompletionRequest,
+        raw_request: Request = None,
+    ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
+        reasoning_effort = (
+            request.chat_template_kwargs.pop("reasoning_effort", None)
+            if request.chat_template_kwargs
+            else None
+        )
+        if self.is_gpt_oss and reasoning_effort == "none":
+            raise ValueError(
+                f"Harmony does not support reasoning effort {reasoning_effort}"
+            )
+
+        if reasoning_effort is not None:
+            request.reasoning_effort = reasoning_effort
+
+        """Convert OpenAI chat completion request to internal format"""
+        is_multimodal = self.tokenizer_manager.model_config.is_multimodal
+
+        # Resolve measurement denominators before _compute_c2kv_segments removes
+        # annotated history messages. This copy follows the same server chat
+        # template and therefore gives every arm one canonical full-history
+        # token frame, independent of its active compressed representation.
+        paper_whole_full_kv_tokens = None
+        paper_history_full_kv_tokens = None
+        paper_history_active_kv_tokens = None
+        paper_canonical_full_source = False
+        paper_denominator_tokenization_duration_ns = None
+        paper_hint = request.c2kv_kv_memory_hint
+        if (
+            not is_multimodal
+            and isinstance(paper_hint, dict)
+            and isinstance(paper_hint.get("paper_measurement"), dict)
+        ):
+            measurement_config = paper_hint["paper_measurement"]
+            paper_canonical_full_source = bool(
+                measurement_config.get("canonical_full_source", False)
+            )
+            denominator_start_ns = time.monotonic_ns()
+            canonical_request = self._paper_history_request(request)
+            canonical_processed = self._process_messages(canonical_request, False)
+            if isinstance(canonical_processed.prompt_ids, list):
+                resolved_history_tokens = self._resolve_paper_history_token_count(
+                    canonical_request, canonical_processed.prompt_ids
+                )
+                if paper_canonical_full_source:
+                    paper_whole_full_kv_tokens = len(canonical_processed.prompt_ids)
+                    paper_history_full_kv_tokens = resolved_history_tokens
+                else:
+                    paper_history_active_kv_tokens = resolved_history_tokens
+            source_messages = measurement_config.get("canonical_source_messages")
+            if source_messages is not None:
+                source_request = self._paper_source_request(request, measurement_config)
+                source_processed = self._process_messages(source_request, False)
+                if not isinstance(source_processed.prompt_ids, list):
+                    raise ValueError("C2KV_PAPER_CANONICAL_SOURCE_TOKENIZATION_FAILED")
+                paper_whole_full_kv_tokens = len(source_processed.prompt_ids)
+                paper_canonical_full_source = True
+                measurement_config["canonical_source_whole_tokens"] = paper_whole_full_kv_tokens
+                measurement_config["canonical_source_server_tokenized"] = True
+                # Retain the token-count receipt, not a copy of the source
+                # conversation in scheduler logs and allocator responses.
+                measurement_config.pop("canonical_source_messages", None)
+                measurement_config.pop("canonical_source_tools", None)
+            paper_denominator_tokenization_duration_ns = (
+                time.monotonic_ns() - denominator_start_ns
+            )
+
+        # Compute C2KV segment boundaries before the chat template is applied
+        c2kv_segments = self._compute_c2kv_segments(request)
+
+        # Process messages and apply chat template
+        processed_messages = self._process_messages(request, is_multimodal)
+        if not is_multimodal and isinstance(processed_messages.prompt_ids, list):
+            self._resolve_tool_kv_schema_spans(
+                request, processed_messages.prompt_ids
+            )
+            self._resolve_history_kv_event_token_spans(
+                request, processed_messages.prompt_ids
+            )
+            self._resolve_history_kv_eviction_range(request, processed_messages.prompt_ids)
+            if paper_history_full_kv_tokens is None and isinstance(
+                request.c2kv_kv_memory_hint, dict
+            ):
+                paper_history_full_kv_tokens = request.c2kv_kv_memory_hint.get(
+                    "full_equivalent_history_tokens"
+                )
+            input_ids, persistent_session_id, canonical_prompt_ids = (
+                self._prepare_persistent_history_delta(
+                    request, list(processed_messages.prompt_ids), c2kv_segments
+                )
+            )
+            if persistent_session_id is not None and c2kv_segments:
+                hint = request.c2kv_kv_memory_hint
+                input_prefix = int(hint.get("tool_memory_input_prefix_tokens") or 0)
+                if input_prefix:
+                    c2kv_segments = [segment for segment in c2kv_segments
+                                     if segment.token_start >= input_prefix]
+                    for segment in c2kv_segments:
+                        segment.token_start -= input_prefix
+                        segment.token_end -= input_prefix
+        else:
+            input_ids = processed_messages.prompt_ids
+            persistent_session_id = None
+            canonical_prompt_ids = None
+
+        # Build sampling parameters
+        sampling_params = request.to_sampling_params(
+            stop=processed_messages.stop,
+            model_generation_config=self.default_sampling_params,
+            tool_call_constraint=processed_messages.tool_call_constraint,
+        )
+
+        # Handle single vs multiple requests
+        if is_multimodal:
+            prompt_kwargs = {"text": processed_messages.prompt}
+        else:
+            if isinstance(processed_messages.prompt_ids, str):
+                prompt_kwargs = {"text": processed_messages.prompt_ids}
+            else:
+                prompt_kwargs = {"input_ids": input_ids}
+
+        # Extract custom labels from raw request headers
+        custom_labels = self.extract_custom_labels(raw_request)
+
+        # Extract routed_dp_rank from header (has higher priority than body)
+        effective_routed_dp_rank = self.extract_routed_dp_rank_from_header(
+            raw_request, request.routed_dp_rank
+        )
+
+        # Resolve LoRA adapter from model parameter or explicit lora_path
+        lora_path = self._resolve_lora_path(request.model, request.lora_path)
+        img_max_dynamic_patch, vid_max_dynamic_patch = _extract_max_dynamic_patch(
+            request
+        )
+        adapted_request = GenerateReqInput(
+            **prompt_kwargs,
+            image_data=processed_messages.image_data,
+            video_data=processed_messages.video_data,
+            audio_data=processed_messages.audio_data,
+            sampling_params=sampling_params,
+            return_logprob=request.logprobs,
+            logprob_start_len=-1,
+            top_logprobs_num=request.top_logprobs or 0,
+            stream=request.stream,
+            return_text_in_logprobs=True,
+            modalities=processed_messages.modalities,
+            lora_path=lora_path,
+            bootstrap_host=request.bootstrap_host,
+            bootstrap_port=request.bootstrap_port,
+            bootstrap_room=request.bootstrap_room,
+            routed_dp_rank=effective_routed_dp_rank,
+            disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,
+            return_hidden_states=request.return_hidden_states,
+            c2kv_prompt_last_hidden_only=(
+                request.return_hidden_states
+                and request.c2kv_prompt_last_hidden_only
+            ),
+            return_routed_experts=request.return_routed_experts,
+            rid=request.rid,
+            c2kv_outer_request_id=(
+                raw_request.headers.get("X-C2KV-Measurement-Request-Id")
+                if raw_request is not None
+                else None
+            ),
+            c2kv_measurement_phase=(
+                raw_request.headers.get("X-C2KV-Measurement-Phase")
+                if raw_request is not None
+                else None
+            ),
+            c2kv_paper_whole_full_kv_tokens=(
+                paper_whole_full_kv_tokens
+            ),
+            c2kv_paper_history_full_kv_tokens=paper_history_full_kv_tokens,
+            c2kv_paper_history_active_kv_tokens=paper_history_active_kv_tokens,
+            c2kv_paper_canonical_full_source=paper_canonical_full_source,
+            c2kv_paper_denominator_tokenization_duration_ns=(
+                paper_denominator_tokenization_duration_ns
+            ),
+            extra_key=self._compute_extra_key(request),
+            require_reasoning=self._get_reasoning_from_request(request),
+            priority=request.priority,
+            routing_key=self.extract_routing_key(raw_request),
+            custom_labels=custom_labels,
+            custom_logit_processor=request.custom_logit_processor,
+            session_params=request.session_params,
+            image_max_dynamic_patch=img_max_dynamic_patch,
+            video_max_dynamic_patch=vid_max_dynamic_patch,
+            max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
+            c2kv_segments=c2kv_segments,
+            c2kv_kv_memory_hint=request.c2kv_kv_memory_hint,
+            # Tri-state request override. None leaves the per-segment values and
+            # --c2kv-query-proj to the scheduler. Do not collapse segment
+            # values here: the scheduler also rejects conflicting explicit
+            # message choices instead of silently selecting one.
+            c2kv_use_gist_projection=getattr(
+                request, "c2kv_use_gist_projection", None
+            ),
+        )
+        if persistent_session_id is not None:
+            adapted_request._persistent_history_session_id = persistent_session_id
+            adapted_request._persistent_history_canonical_prompt_ids = canonical_prompt_ids
+            # Derive the removable suffix from the same template and options.
+            # A client may request a recovery append, but cannot nominate raw
+            # history tokens to truncate or replay.
+            body_ids = self._c2kv_chat_template_input_ids(
+                request, list(request.messages), self._chat_template_tools(request)
+            )
+            if canonical_prompt_ids[:len(body_ids)] == body_ids:
+                adapted_request._persistent_history_generation_prefix_ids = (
+                    canonical_prompt_ids[len(body_ids):]
+                )
+            else:
+                adapted_request._persistent_history_generation_prefix_ids = []
+
+        self._attach_parity_debug(
+            request,
+            adapted_request,
+            list(processed_messages.prompt_ids)
+            if isinstance(processed_messages.prompt_ids, list)
+            else None,
+            input_ids if isinstance(input_ids, list) else None,
+        )
+
+        if request.c2kv_kv_memory_hint:
+            logger.info(
+                "C2KV KV-memory hint accepted rid=%s history_eviction=%s",
+                adapted_request.rid,
+                bool(request.c2kv_kv_memory_hint.get("history_kv_eviction")),
+            )
+
+        return adapted_request, request
+
+    def _process_messages(
+        self, request: ChatCompletionRequest, is_multimodal: bool
+    ) -> MessageProcessingResult:
+        """Process chat messages and apply chat template"""
+        # GptOss model needs to keep special tokens for harmony parsing
+        if self.is_gpt_oss:
+            request.skip_special_tokens = False
+
+        self._patch_mistral_skip_special_tokens(request)
+
+        tool_call_constraint = None
+
+        # Apply chat template and its stop strings
+        tools = self._chat_template_tools(request)
+        # Tool-call parsing follows request.tools even when the schemas are
+        # kept out of the prompt (c2kv_tools_in_prompt=False).
+        parse_tool_calls = tools is not None or bool(
+            request.tools
+            and request.tool_choice != "none"
+            and getattr(request, "c2kv_tools_in_prompt", None) is False
+        )
+        if parse_tool_calls:
+            request.skip_special_tokens = False
+            if self.tool_call_parser:
+                parser = FunctionCallParser(request.tools, self.tool_call_parser)
+                tool_call_constraint = parser.get_structure_constraint(
+                    request.tool_choice,
+                    parallel_tool_calls=request.parallel_tool_calls,
+                )
+            # Handle JSON schema constraint directly for required or named tool choice
+            if request.tool_choice == "required" or isinstance(
+                request.tool_choice, ToolChoice
+            ):
+                json_schema = get_json_schema_constraint(
+                    request.tools,
+                    request.tool_choice,
+                    parallel_tool_calls=request.parallel_tool_calls,
+                )
+                tool_call_constraint = ("json_schema", json_schema)
+
+        # Use chat template
+        if self.template_manager.chat_template_name is None:
+            result = self._apply_jinja_template(request, tools, is_multimodal)
+        else:
+            result = self._apply_conversation_template(request, is_multimodal)
+
+        result.tool_call_constraint = tool_call_constraint
+        return result
+
+    def _apply_jinja_template(
+        self,
+        request: ChatCompletionRequest,
+        tools: Optional[List[Dict]],
+        is_multimodal: bool,
+    ) -> MessageProcessingResult:
+        """Apply Jinja chat template"""
+        prompt = ""
+        prompt_ids = []
+        openai_compatible_messages = []
+        image_data = []
+        video_data = []
+        audio_data = []
+        modalities = []
+
+        template_content_format = self.template_manager.jinja_template_content_format
+
+        if self.use_dpsk_v32_encoding:
+            thinking_mode = (
+                "thinking"
+                if (request.chat_template_kwargs or {}).get("thinking")
+                else "chat"
+            )
+            messages = request.messages
+            messages = [msg.model_dump() for msg in messages]
+
+            for msg in messages:
+                if msg.get("content") is None:
+                    msg["content"] = ""
+                processed_msg = process_content_for_template_format(
+                    msg,
+                    template_content_format,
+                    image_data,
+                    video_data,
+                    audio_data,
+                    modalities,
+                    use_dpsk_v32_encoding=self.use_dpsk_v32_encoding,
+                )
+                msg.update(processed_msg)
+
+            # Handle continue_final_message: separate final assistant message
+            messages, assistant_prefix = self._handle_last_assistant_message(
+                messages, request
+            )
+
+            if messages[0]["role"] != "system":
+                # insert an empty system prompt to help render tool system prompt
+                messages.insert(0, {"role": "system", "content": ""})
+            if request.tools and tools is not None:
+                messages[0]["tools"] = [tool.model_dump() for tool in request.tools]
+            real_input = encode_messages(messages, thinking_mode=thinking_mode)
+            prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+
+            # Append assistant prefix if continue_final_message is enabled
+            if assistant_prefix:
+                prompt_ids = self._append_assistant_prefix_to_prompt_ids(
+                    prompt_ids, assistant_prefix
+                )
+        else:
+            for message in request.messages:
+                if message.content is None:
+                    message.content = ""
+                msg_dict = message.model_dump()
+
+                # Process content based on detected template format
+                processed_msg = process_content_for_template_format(
+                    msg_dict,
+                    template_content_format,
+                    image_data,
+                    video_data,
+                    audio_data,
+                    modalities,
+                )
+
+                # per the Transformers docs & maintainers, tool call arguments in
+                # assistant-role messages with tool_calls need to be dicts not JSON str -
+                # this is how tool-use chat templates will expect them moving forwards
+                # so, for messages that have tool_calls, parse the string (which we get
+                # from openAI format) to dict
+                if (
+                    processed_msg["role"] == "assistant"
+                    and "tool_calls" in processed_msg
+                    and isinstance(processed_msg["tool_calls"], list)
+                ):
+                    for item in processed_msg["tool_calls"]:
+                        if "arguments" in item["function"] and isinstance(
+                            item["function"]["arguments"], str
+                        ):
+                            item["function"]["arguments"] = orjson.loads(
+                                item["function"]["arguments"]
+                            )
+
+                openai_compatible_messages.append(processed_msg)
+
+            # Handle continue_final_message: separate final assistant message
+            openai_compatible_messages, assistant_prefix = (
+                self._handle_last_assistant_message(openai_compatible_messages, request)
+            )
+
+            extra_template_kwargs = {}
+            if request.reasoning_effort is not None:
+                extra_template_kwargs["reasoning_effort"] = request.reasoning_effort
+            if request.chat_template_kwargs:
+                extra_template_kwargs.update(request.chat_template_kwargs)
+
+            try:
+                prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+                    openai_compatible_messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    tools=tools,
+                    return_dict=False,
+                    **extra_template_kwargs,
+                )
+            except Exception as e:
+                # If the first attempt fails, try with flat function-only format.
+                # Some templates (e.g. Mistral) expect tools without the OpenAI wrapper.
+                tools = (
+                    [t["function"] if "function" in t else t for t in tools]
+                    if tools
+                    else None
+                )
+                try:
+                    prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+                        openai_compatible_messages,
+                        tokenize=True,
+                        add_generation_prompt=True,
+                        tools=tools,
+                        return_dict=False,
+                        **extra_template_kwargs,
+                    )
+                except jinja2.TemplateError as template_error:
+                    # Template errors (e.g., from raise_exception in Jinja templates)
+                    # should be treated as client errors (400 BadRequest)
+                    raise ValueError(str(template_error)) from template_error
+
+            # Append assistant prefix if continue_final_message is enabled
+            if assistant_prefix:
+                prompt_ids = self._append_assistant_prefix_to_prompt_ids(
+                    prompt_ids, assistant_prefix
+                )
+
+            if is_multimodal:
+                prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
+
+        stop = request.stop
+        image_data = image_data if image_data else None
+        audio_data = audio_data if audio_data else None
+        video_data = video_data if video_data else None
+        modalities = modalities if modalities else []
+        return MessageProcessingResult(
+            prompt=prompt,
+            prompt_ids=prompt_ids,
+            image_data=image_data,
+            video_data=video_data,
+            audio_data=audio_data,
+            modalities=modalities,
+            stop=stop,
+        )
+
+    def _apply_conversation_template(
+        self,
+        request: ChatCompletionRequest,
+        is_multimodal: bool,
+    ) -> MessageProcessingResult:
+        """Apply conversation template"""
+        prompt = ""
+        prompt_ids = []
+        conv = generate_chat_conv(request, self.template_manager.chat_template_name)
+
+        # If we should continue the final assistant message, adjust the conversation.
+        if (
+            request.continue_final_message
+            and request.messages
+            and request.messages[-1].role == "assistant"
+        ):
+            # Remove the auto-added blank assistant turn, if present.
+            if conv.messages and conv.messages[-1][1] is None:
+                conv.messages.pop()
+            # Rebuild the prompt from the conversation.
+            prompt = conv.get_prompt()
+            # Strip trailing stop tokens or separators that indicate end-of-assistant.
+            if isinstance(conv.stop_str, list):
+                for stop_token in conv.stop_str:
+                    if prompt.endswith(stop_token):
+                        prompt = prompt[: -len(stop_token)]
+            elif isinstance(conv.stop_str, str) and prompt.endswith(conv.stop_str):
+                prompt = prompt[: -len(conv.stop_str)]
+            if conv.sep and prompt.endswith(conv.sep):
+                prompt = prompt[: -len(conv.sep)]
+            if getattr(conv, "sep2", None) and prompt.endswith(conv.sep2):
+                prompt = prompt[: -len(conv.sep2)]
+        else:
+            prompt = conv.get_prompt()
+            if self._get_reasoning_from_request(
+                request
+            ) and self.reasoning_parser not in ["qwen3", "qwen3-thinking", "glm4"]:
+                # qwen3 and glm4 think internally without a leading <think> token
+                prompt += "<think>"  # Note(Xinyuan): hard code thinking token
+
+        image_data = conv.image_data if conv.image_data else None
+        video_data = conv.video_data if conv.video_data else None
+        audio_data = conv.audio_data if conv.audio_data else None
+        modalities = conv.modalities if conv.modalities else []
+        stop = copy.copy(conv.stop_str or [] if not request.ignore_eos else [])
+
+        if request.stop:
+            if isinstance(request.stop, str):
+                stop.append(request.stop)
+            else:
+                stop.extend(request.stop)
+
+        if not is_multimodal:
+            prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt)
+
+        return MessageProcessingResult(
+            prompt=prompt,
+            prompt_ids=prompt_ids,
+            image_data=image_data,
+            video_data=video_data,
+            audio_data=audio_data,
+            modalities=modalities,
+            stop=stop,
+        )
+
+    async def _handle_streaming_request(
+        self,
+        adapted_request: GenerateReqInput,
+        request: ChatCompletionRequest,
+        raw_request: Request,
+    ) -> Union[StreamingResponse, ErrorResponse]:
+        """Handle streaming chat completion request"""
+        generator = self._generate_chat_stream(adapted_request, request, raw_request)
+
+        # Kick-start the generator to trigger validation before HTTP 200 is sent.
+        # If validation fails (e.g., context length exceeded), we can still return
+        # a proper HTTP 400 error response instead of streaming it as SSE payload.
+        try:
+            first_chunk = await generator.__anext__()
+        except ValueError as e:
+            return self.create_error_response(str(e))
+
+        async def prepend_first_chunk():
+            yield first_chunk
+            async for chunk in generator:
+                yield chunk
+
+        return StreamingResponse(
+            prepend_first_chunk(),
+            media_type="text/event-stream",
+            background=self.tokenizer_manager.create_abort_task(adapted_request),
+        )
+
+    async def _generate_chat_stream(
+        self,
+        adapted_request: GenerateReqInput,
+        request: ChatCompletionRequest,
+        raw_request: Request,
+    ) -> AsyncGenerator[str, None]:
+        """Generate streaming chat completion response"""
+        # Parsers for tool calls and reasoning
+        parser_dict = {}
+        reasoning_parser_dict = {}
+
+        # State tracking for streaming
+        is_firsts = {}
+        stream_buffers = {}
+        n_prev_tokens = {}
+        has_tool_calls = {}
+        finish_reasons = {}
+
+        # Usage tracking
+        prompt_tokens = {}
+        reasoning_tokens = {}
+        completion_tokens = {}
+        cached_tokens = {}
+        hidden_states = {}
+        routed_experts = {}
+
+        stream_started = False
+        try:
+            include_usage, continuous_usage_stats = should_include_usage(
+                request.stream_options,
+                self.tokenizer_manager.server_args.stream_response_default_include_usage,
+            )
+
+            async for content in self.tokenizer_manager.generate_request(
+                adapted_request, raw_request
+            ):
+                index = content.get("index", 0)
+
+                prompt_tokens[index] = content["meta_info"].get("prompt_tokens", 0)
+                completion_tokens[index] = content["meta_info"].get(
+                    "completion_tokens", 0
+                )
+                reasoning_tokens[index] = content["meta_info"].get(
+                    "reasoning_tokens", 0
+                )
+                cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
+                hidden_states[index] = content["meta_info"].get("hidden_states", None)
+                routed_experts[index] = content["meta_info"].get("routed_experts", None)
+
+                # Handle logprobs
+                choice_logprobs = None
+                if request.logprobs:
+                    n_prev_token = n_prev_tokens.get(index, 0)
+                    total_output_logprobs = content["meta_info"][
+                        "output_token_logprobs_length"
+                    ]
+                    if n_prev_token < total_output_logprobs:
+                        choice_logprobs = self._process_streaming_logprobs(
+                            content, n_prev_token, total_output_logprobs
+                        )
+                    n_prev_tokens[index] = total_output_logprobs
+
+                finish_reason = content["meta_info"].get("finish_reason", None)
+                finish_reason_type = finish_reason["type"] if finish_reason else None
+
+                # Track finish_reason for each index
+                if finish_reason_type:
+                    # If the abort is from scheduler.
+                    if finish_reason_type == "abort":
+                        code = finish_reason.get(
+                            "status_code", HTTPStatus.INTERNAL_SERVER_ERROR
+                        )
+                        error = self.create_streaming_error_response(
+                            finish_reason.get("message", "Generation aborted."),
+                            code.name,
+                            code.value,
+                        )
+                        yield f"data: {error}\n\n"
+                        break
+                    else:
+                        finish_reasons[index] = finish_reason
+
+                # First chunk with role
+                if is_firsts.get(index, True):
+                    is_firsts[index] = False
+                    delta = DeltaMessage(role="assistant", content="")
+                    choice_data = ChatCompletionResponseStreamChoice(
+                        index=index,
+                        delta=delta,
+                        finish_reason=None,
+                        logprobs=None,
+                    )
+                    chunk = ChatCompletionStreamResponse(
+                        id=content["meta_info"]["id"],
+                        created=int(time.time()),
+                        choices=[choice_data],
+                        model=request.model,
+                    )
+                    yield f"data: {chunk.model_dump_json()}\n\n"
+                    stream_started = True
+
+                stream_buffer = stream_buffers.get(index, "")
+                delta = content["text"][len(stream_buffer) :]
+                stream_buffers[index] = stream_buffer + delta
+
+                # Handle reasoning content
+                if self.reasoning_parser and request.separate_reasoning:
+                    reasoning_text, delta = self._process_reasoning_stream(
+                        index, delta, reasoning_parser_dict, content, request
+                    )
+                    if reasoning_text:
+                        choice_data = ChatCompletionResponseStreamChoice(
+                            index=index,
+                            delta=DeltaMessage(reasoning_content=reasoning_text),
+                            finish_reason=None,
+                        )
+                        chunk = ChatCompletionStreamResponse(
+                            id=content["meta_info"]["id"],
+                            created=int(time.time()),
+                            choices=[choice_data],
+                            model=request.model,
+                        )
+
+                        # Add usage stats if continuous_usage_stats is enabled
+                        if continuous_usage_stats:
+                            chunk.usage = UsageProcessor.calculate_token_usage(
+                                prompt_tokens=prompt_tokens.get(index, 0),
+                                reasoning_tokens=reasoning_tokens.get(index, 0),
+                                completion_tokens=completion_tokens.get(index, 0),
+                            )
+
+                        yield f"data: {chunk.model_dump_json()}\n\n"
+
+                # Handle tool calls
+                if (
+                    request.tool_choice != "none"
+                    and request.tools
+                    and self.tool_call_parser
+                ):
+                    async for chunk in self._process_tool_call_stream(
+                        index,
+                        delta,
+                        parser_dict,
+                        content,
+                        request,
+                        has_tool_calls,
+                        continuous_usage_stats,
+                    ):
+                        if chunk:
+                            yield chunk
+
+                    # Send any remaining tool call arguments when generation finishes
+                    if finish_reason_type is not None and index in parser_dict:
+                        parser = parser_dict[index]
+                        remaining_chunk = self._check_for_unstreamed_tool_args(
+                            parser, content, request, index
+                        )
+                        if remaining_chunk:
+                            yield remaining_chunk
+
+                else:
+                    # Regular content
+                    if delta:
+                        choice_data = ChatCompletionResponseStreamChoice(
+                            index=index,
+                            delta=DeltaMessage(content=delta),
+                            finish_reason=None,
+                            matched_stop=None,
+                            logprobs=choice_logprobs,
+                        )
+                        chunk = ChatCompletionStreamResponse(
+                            id=content["meta_info"]["id"],
+                            created=int(time.time()),
+                            choices=[choice_data],
+                            model=request.model,
+                        )
+
+                        # Add usage stats if continuous_usage_stats is enabled
+                        if continuous_usage_stats:
+                            chunk.usage = UsageProcessor.calculate_token_usage(
+                                prompt_tokens=prompt_tokens.get(index, 0),
+                                reasoning_tokens=reasoning_tokens.get(index, 0),
+                                completion_tokens=completion_tokens.get(index, 0),
+                            )
+
+                        yield f"data: {chunk.model_dump_json()}\n\n"
+
+            # Send finish_reason chunks for each index that completed
+            for idx, finish_reason_data in finish_reasons.items():
+                finish_reason_type = finish_reason_data["type"]
+
+                # Change finish_reason to "tool_calls" if we had tool calls and stopped naturally
+                final_finish_reason = finish_reason_type
+                if has_tool_calls.get(idx, False) and finish_reason_type == "stop":
+                    final_finish_reason = "tool_calls"
+
+                finish_reason_chunk = ChatCompletionStreamResponse(
+                    id=content["meta_info"][
+                        "id"
+                    ],  # NOTE: openai uses the same chatcmpl-id for all indices
+                    created=int(time.time()),
+                    choices=[
+                        ChatCompletionResponseStreamChoice(
+                            index=idx,
+                            delta=DeltaMessage(),
+                            finish_reason=final_finish_reason,
+                            matched_stop=(
+                                finish_reason_data["matched"]
+                                if "matched" in finish_reason_data
+                                else None
+                            ),
+                        )
+                    ],
+                    model=request.model,
+                    usage=None,
+                )
+                yield f"data: {finish_reason_chunk.model_dump_json()}\n\n"
+
+            # Send hidden states if requested
+            if request.return_hidden_states and hidden_states:
+                for index, choice_hidden_states in hidden_states.items():
+                    if choice_hidden_states:
+                        last_token_hidden_states = (
+                            choice_hidden_states[-1]
+                            if len(choice_hidden_states) > 1
+                            else []
+                        )
+                        hidden_states_chunk = ChatCompletionStreamResponse(
+                            id=content["meta_info"]["id"],
+                            created=int(time.time()),
+                            choices=[
+                                ChatCompletionResponseStreamChoice(
+                                    index=index,
+                                    delta=DeltaMessage(
+                                        hidden_states=last_token_hidden_states
+                                    ),
+                                    finish_reason=None,  # Hidden states don't need finish_reason
+                                )
+                            ],
+                            model=request.model,
+                        )
+                        yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
+
+            if request.return_routed_experts and routed_experts:
+                # Get first non-None routed_experts value
+                first_routed_experts = next(
+                    (v for v in routed_experts.values() if v is not None), None
+                )
+                if first_routed_experts is not None:
+                    routed_experts_chunk = ChatCompletionStreamResponse(
+                        id=content["meta_info"]["id"],
+                        created=int(time.time()),
+                        choices=[],  # sglext is at response level
+                        model=request.model,
+                        sglext=SglExt(routed_experts=first_routed_experts),
+                    )
+                    yield f"data: {routed_experts_chunk.model_dump_json()}\n\n"
+
+            # Additional usage chunk
+            if include_usage:
+                usage = UsageProcessor.calculate_streaming_usage(
+                    prompt_tokens,
+                    reasoning_tokens,
+                    completion_tokens,
+                    cached_tokens=cached_tokens,
+                    n_choices=request.n,
+                    enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
+                )
+                usage_chunk = ChatCompletionStreamResponse(
+                    id=content["meta_info"]["id"],
+                    created=int(time.time()),
+                    choices=[],  # Empty choices array as per OpenAI spec
+                    model=request.model,
+                    usage=usage,
+                )
+                yield f"data: {usage_chunk.model_dump_json()}\n\n"
+
+        except ValueError as e:
+            if not stream_started:
+                raise
+            error = self.create_streaming_error_response(str(e))
+            yield f"data: {error}\n\n"
+
+        yield "data: [DONE]\n\n"
+
+    async def _handle_non_streaming_request(
+        self,
+        adapted_request: GenerateReqInput,
+        request: ChatCompletionRequest,
+        raw_request: Request,
+    ) -> Union[ChatCompletionResponse, ErrorResponse, ORJSONResponse]:
+        """Handle non-streaming chat completion request"""
+        try:
+            ret = await self.tokenizer_manager.generate_request(
+                adapted_request, raw_request
+            ).__anext__()
+        except ValueError as e:
+            hint = getattr(adapted_request, "c2kv_kv_memory_hint", None) or {}
+            if hint.get("persistent_session_drop_generation_prefix_tokens"):
+                # A recovery splice is intentionally destructive only to the
+                # generation scaffold. If the replacement request fails after
+                # scheduler admission, its request node and physical slot can
+                # no longer be proven equivalent to the old canonical prompt.
+                # Fail closed instead of allowing a later append or fallback.
+                session_id = getattr(
+                    adapted_request, "_persistent_history_session_id", None
+                )
+                if session_id:
+                    try:
+                        await self.tokenizer_manager.close_session(
+                            CloseSessionReqInput(session_id=session_id), raw_request
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to close an aborted persistent recovery session %s",
+                            session_id,
+                        )
+                    self.release_persistent_history_session(session_id)
+            return self.create_error_response(str(e))
+
+        if not isinstance(ret, list):
+            ret = [ret]
+
+        if not request.racer_draft:
+            self._commit_persistent_history_session(adapted_request, ret)
+        parity_debug = getattr(adapted_request, "_parity_debug", None)
+        if isinstance(parity_debug, dict) and ret:
+            ret[0].setdefault("meta_info", {})["parity_debug"] = parity_debug
+
+        response = self._build_chat_response(
+            request,
+            ret,
+            int(time.time()),
+        )
+
+        return response
+
+    def _build_chat_response(
+        self,
+        request: ChatCompletionRequest,
+        ret: List[Dict[str, Any]],
+        created: int,
+    ) -> Union[ChatCompletionResponse, ORJSONResponse]:
+        """Build chat completion response from generation results"""
+        choices = []
+
+        # Build sglext at response level (from first ret_item, as these are per-request)
+        first_ret = ret[0]
+        routed_experts = process_routed_experts_from_ret(first_ret, request)
+        cached_tokens_details = process_cached_tokens_details_from_ret(
+            first_ret, request
+        )
+        response_sglext = None
+        if routed_experts or cached_tokens_details:
+            response_sglext = SglExt(
+                routed_experts=routed_experts,
+                cached_tokens_details=cached_tokens_details,
+            )
+
+        for idx, ret_item in enumerate(ret):
+            # Process logprobs
+            choice_logprobs = None
+            if request.logprobs:
+                choice_logprobs = self._process_response_logprobs(ret_item)
+
+            # Handle hidden states
+            hidden_states = process_hidden_states_from_ret(ret_item, request)
+
+            finish_reason = ret_item["meta_info"]["finish_reason"]
+            text = ret_item["text"]
+
+            # Handle reasoning content
+            reasoning_text = None
+            reasoning_parser = self.reasoning_parser
+            if reasoning_parser and request.separate_reasoning:
+                is_force_reasoning = (
+                    self.template_manager.force_reasoning
+                    or self._get_reasoning_from_request(request)
+                )
+                try:
+                    parser = ReasoningParser(
+                        model_type=reasoning_parser,
+                        stream_reasoning=False,
+                        force_reasoning=is_force_reasoning,
+                        request=request,
+                    )
+                    reasoning_text, text = parser.parse_non_stream(text)
+                except Exception as e:
+                    logger.error(f"Reasoning parsing error: {e}")
+                    return self.create_error_response(
+                        "Failed to parse reasoning content",
+                        err_type="InternalServerError",
+                        status_code=500,
+                    )
+
+            # Handle tool calls
+            tool_calls = None
+            if (
+                request.tool_choice != "none"
+                and request.tools
+                and self.tool_call_parser
+            ):
+                history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
+                tool_calls, text, finish_reason = self._process_tool_calls(
+                    text,
+                    request.tools,
+                    finish_reason,
+                    request.tool_choice,
+                    history_tool_calls_cnt,
+                )
+
+            choice_data = ChatCompletionResponseChoice(
+                index=idx,
+                message=ChatMessage(
+                    role="assistant",
+                    content=text if text else None,
+                    tool_calls=tool_calls,
+                    reasoning_content=reasoning_text if reasoning_text else None,
+                ),
+                logprobs=choice_logprobs,
+                finish_reason=finish_reason["type"] if finish_reason else None,
+                matched_stop=(
+                    finish_reason["matched"]
+                    if finish_reason and "matched" in finish_reason
+                    else None
+                ),
+                hidden_states=hidden_states,
+            )
+            choices.append(choice_data)
+
+        # Calculate usage
+        usage = UsageProcessor.calculate_response_usage(
+            ret,
+            n_choices=request.n,
+            enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
+        )
+
+        kv_memory_report = ret[0]["meta_info"].get("kv_memory_report")
+        if kv_memory_report is not None:
+            logger.info(
+                "C2KV KV-memory report returned rid=%s status=%s",
+                ret[0]["meta_info"]["id"],
+                kv_memory_report.get("history_kv_runtime_status"),
+            )
+
+        metadata = {
+            "weight_version": ret[0]["meta_info"]["weight_version"],
+            "sglang_runtime": ret[0]["meta_info"].get("kv_runtime_stats"),
+            # RequestTimeStats records the first sampled token before HTTP
+            # transport. Surface that existing measurement for ordinary chat
+            # requests instead of treating total request latency as TTFT.
+            "speed_timing": ret[0]["meta_info"].get("speed_timing"),
+            # Keep the per-request layout report produced by the scheduler.
+            # BFCL uses this to distinguish measured physical KV residency
+            # from client-side history-token estimates.
+            "kv_memory_report": kv_memory_report,
+            "persistent_history_session": ret[0]["meta_info"].get(
+                "persistent_history_session"
+            ),
+        }
+        parity_debug = ret[0]["meta_info"].get("parity_debug")
+        if isinstance(parity_debug, dict):
+            metadata["parity_debug"] = parity_debug
+        # A C2KV injection that fails mid-prefill ends as FINISH_ABORT with no
+        # status_code, i.e. an HTTP 200 whose finish_reason.type is "abort";
+        # the per-choice field above copies only finish_reason["type"], so the
+        # reason string would otherwise never reach an OpenAI client. Surface
+        # it at response level, next to sglang_runtime (whose
+        # c2kv_injection_error carries the same C2KV_* code). Only for an
+        # abort, and only as an extra metadata key -- the HTTP status and every
+        # existing field are unchanged. See c2kv/c2kv_serving_semantics.md
+        # section 3.
+        first_finish_reason = ret[0]["meta_info"].get("finish_reason") or {}
+        if first_finish_reason.get("type") == "abort":
+            metadata["finish_message"] = first_finish_reason.get("message")
+
+        return ChatCompletionResponse(
+            id=ret[0]["meta_info"]["id"],
+            created=created,
+            model=request.model,
+            choices=choices,
+            usage=usage,
+            metadata=metadata,
+            sglext=response_sglext,
+        )
+
+    def _process_logprobs_tokens(
+        self, logprobs: LogProbs, use_token_index: bool = False
+    ) -> List[ChatCompletionTokenLogprob]:
+        """Common helper to process logprobs tokens for both streaming and non-streaming
+
+        Args:
+            logprobs: LogProbs data from model
+            use_token_index: True for non-streaming (use token_idx), False for streaming (use index 0)
+        """
+        token_logprobs = []
+
+        for token_idx, (token, logprob) in enumerate(
+            zip(logprobs.tokens, logprobs.token_logprobs)
+        ):
+            token_bytes = list(token.encode("utf-8"))
+            top_logprobs = []
+            if logprobs.top_logprobs:
+                # - Non-streaming (use_token_index=True): uses token_idx for full data
+                # - Streaming (use_token_index=False): uses index 0 for pre-sliced data
+                top_logprobs_idx = token_idx if use_token_index else 0
+                for top_token, top_logprob in logprobs.top_logprobs[
+                    top_logprobs_idx
+                ].items():
+                    top_token_bytes = list(top_token.encode("utf-8"))
+                    top_logprobs.append(
+                        TopLogprob(
+                            token=top_token,
+                            bytes=top_token_bytes,
+                            logprob=top_logprob,
+                        )
+                    )
+            token_logprobs.append(
+                ChatCompletionTokenLogprob(
+                    token=token,
+                    bytes=token_bytes,
+                    logprob=logprob,
+                    top_logprobs=top_logprobs,
+                )
+            )
+
+        return token_logprobs
+
+    def _process_response_logprobs(self, ret_item: Dict[str, Any]) -> ChoiceLogprobs:
+        """Process logprobs for non-streaming response"""
+        logprobs = to_openai_style_logprobs(
+            output_token_logprobs=ret_item["meta_info"]["output_token_logprobs"],
+            output_top_logprobs=ret_item["meta_info"].get("output_top_logprobs", None),
+        )
+
+        token_logprobs = self._process_logprobs_tokens(logprobs, use_token_index=True)
+        return ChoiceLogprobs(content=token_logprobs)
+
+    def _process_tool_call_id(
+        self,
+        call_item: ToolCallItem,
+        history_tool_calls_cnt: int,
+    ) -> str:
+        """Process for generating a new and unique `tool_call_id`"""
+        if self.tool_call_parser != "kimi_k2":
+            # A simple uuid is sufficient for all models except for Kimi-K2.
+            tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
+            return tool_call_id
+        else:
+            # Align with Kimi-K2 format: functions.{name}:{index}
+            # Kimi-K2 allows multiple tool_calls in one message; SGLang sets call_item.tool_index to the *local* position inside that message.
+            # Therefore, the index must be corrected by using `history_tool_calls_cnt + call_item.tool_index` to ensure globally unique and properly ordered.
+            tool_call_id = f"functions.{call_item.name}:{history_tool_calls_cnt+call_item.tool_index}"
+            logger.debug(
+                f"Process tool call idx, parser: {self.tool_call_parser}, tool_call_id: {tool_call_id}, history_cnt: {history_tool_calls_cnt}"
+            )
+            return tool_call_id
+
+    def _process_tool_calls(
+        self,
+        text: str,
+        tools: List[Any],
+        finish_reason: Dict[str, Any],
+        tool_choice: Optional[Union[str, ToolChoice]] = None,
+        history_tool_calls_cnt: int = 0,
+    ) -> ToolCallProcessingResult:
+        """Process tool calls in the response"""
+
+        # Handle required or named tool choice
+        if tool_choice == "required" or (
+            isinstance(tool_choice, ToolChoice) and tool_choice.type == "function"
+        ):
+            # Set finish reason to tool_calls since we're processing tool calls
+            if finish_reason["type"] == "stop":
+                finish_reason["type"] = "tool_calls"
+                finish_reason["matched"] = None
+            try:
+                # For required tool choice, we expect a JSON array of tool calls
+                tool_call_data = orjson.loads(text)
+                tool_calls = []
+                for i, tool in enumerate(tool_call_data):
+                    # Create a ToolCallItem from the JSON data
+                    call_info = ToolCallItem(
+                        tool_index=i,  # Use the loop index as tool_index
+                        name=tool["name"],
+                        parameters=json.dumps(tool["parameters"], ensure_ascii=False),
+                    )
+                    tool_id = self._process_tool_call_id(
+                        call_info, history_tool_calls_cnt
+                    )
+                    tool_calls.append(
+                        ToolCall(
+                            id=tool_id,
+                            index=i,
+                            function=FunctionResponse(
+                                name=tool["name"],
+                                arguments=json.dumps(
+                                    tool["parameters"], ensure_ascii=False
+                                ),
+                            ),
+                        )
+                    )
+                return ToolCallProcessingResult(tool_calls, "", finish_reason)
+            except json.JSONDecodeError as e:
+                logger.error(f"Tool call parsing error: {e}")
+                return ToolCallProcessingResult(None, text, finish_reason)
+
+        # Use parser since output is not constrained by JSON schema
+        parser = FunctionCallParser(tools, self.tool_call_parser)
+        if parser.has_tool_call(text):
+            if finish_reason["type"] == "stop":
+                finish_reason["type"] = "tool_calls"
+                finish_reason["matched"] = None
+            try:
+                text, call_info_list = parser.parse_non_stream(text)
+                tool_calls = []
+                for call_info in call_info_list:
+                    tool_id = self._process_tool_call_id(
+                        call_info, history_tool_calls_cnt
+                    )
+                    tool_calls.append(
+                        ToolCall(
+                            id=tool_id,
+                            index=getattr(call_info, "tool_index", None),
+                            function=FunctionResponse(
+                                name=call_info.name, arguments=call_info.parameters
+                            ),
+                        )
+                    )
+                return ToolCallProcessingResult(tool_calls, text, finish_reason)
+            except Exception as e:
+                logger.error(f"Tool call parsing error: {e}")
+                # Return error but don't fail the whole request
+                return ToolCallProcessingResult(None, text, finish_reason)
+
+        return ToolCallProcessingResult(None, text, finish_reason)
+
+    def _process_streaming_logprobs(
+        self,
+        content: Dict[str, Any],
+        n_prev_token: int,
+        total_output_logprobs: int,
+    ) -> ChoiceLogprobs:
+        """Process logprobs for streaming response"""
+        logprobs = to_openai_style_logprobs(
+            output_token_logprobs=content["meta_info"]["output_token_logprobs"][
+                n_prev_token:total_output_logprobs
+            ],
+            output_top_logprobs=content["meta_info"].get("output_top_logprobs", [])[
+                n_prev_token:total_output_logprobs
+            ],
+        )
+
+        token_logprobs = self._process_logprobs_tokens(logprobs, use_token_index=False)
+        return ChoiceLogprobs(content=token_logprobs)
+
+    def _process_reasoning_stream(
+        self,
+        index: int,
+        delta: str,
+        reasoning_parser_dict: Dict[int, ReasoningParser],
+        content: Dict[str, Any],
+        request: ChatCompletionRequest,
+    ) -> tuple[Optional[str], str]:
+        """Process reasoning content in streaming response"""
+        if index not in reasoning_parser_dict:
+            is_force_reasoning = (
+                self.template_manager.force_reasoning
+                or self._get_reasoning_from_request(request)
+            )
+            reasoning_parser_dict[index] = ReasoningParser(
+                self.reasoning_parser,
+                request.stream_reasoning,
+                is_force_reasoning,
+                request,
+            )
+        reasoning_parser = reasoning_parser_dict[index]
+        return reasoning_parser.parse_stream_chunk(delta)
+
+    def _get_history_tool_calls_cnt(self, request: ChatCompletionRequest) -> int:
+        """Counts the number of tool calls in the request's message history.
+
+        NOTE: This method is only useful for models that include self-increasing
+        history tool call idx in tool calls id, such as kimi-k2
+
+        Args:
+            request: The chat completion request object.
+
+        Returns:
+            The total number of tool calls in the history, or 0 if not applicable.
+        """
+        messages = getattr(request, "messages", [])
+        idx = 0
+        for msg in messages:
+            if msg.role == "assistant":
+                tool_calls = getattr(msg, "tool_calls", None)
+                idx += len(list(tool_calls)) if tool_calls is not None else 0  # noqa
+        return idx
+
+    def _patch_mistral_skip_special_tokens(
+        self, request: ChatCompletionRequest
+    ) -> None:
+        """Mistral uses special tokens ([THINK]/[/THINK]) for reasoning markers,
+        which get stripped when skip_special_tokens=True."""
+        if (
+            self.reasoning_parser in ["mistral"]
+            and request.reasoning_effort is not None
+            and request.reasoning_effort != "none"
+        ):
+            request.skip_special_tokens = False
+
+    def _get_reasoning_from_request(self, request: ChatCompletionRequest) -> bool:
+        """Judge whether the request needs reasoning for hybrid reasoning models
+        NOTE: This is predefined based on model's chat template
+        """
+        if not self.reasoning_parser:
+            return False
+        if self.reasoning_parser in ["deepseek-v3"]:
+            # Models that require explicit enable thinking (thinking=True)
+            return (
+                request.chat_template_kwargs is not None
+                and request.chat_template_kwargs.get("thinking") is True
+            )
+        if self.reasoning_parser in ["kimi_k2"]:
+            # Models that thinking by default, and can be disabled by setting thinking=False
+            return (
+                not request.chat_template_kwargs
+                or request.chat_template_kwargs.get("thinking") is not False
+            )
+        if self.reasoning_parser in ["qwen3", "glm45", "nemotron_3", "interns1"]:
+            # Models that thinking by default, and can be disabled by setting enable_thinking=False
+            return (
+                not request.chat_template_kwargs
+                or request.chat_template_kwargs.get("enable_thinking") is not False
+            )
+        if self.reasoning_parser in ["mimo"]:
+            # Models that require explicit enable thinking (enable_thinking=True)
+            return (
+                request.chat_template_kwargs is not None
+                and request.chat_template_kwargs.get("enable_thinking") is True
+            )
+        if self.reasoning_parser in ["mistral"]:
+            # Mistral models only reason when reasoning_effort is explicitly
+            # set to a value other than None/"none" (typically "high").
+            return (
+                request.reasoning_effort is not None
+                and request.reasoning_effort != "none"
+            )
+        return True  # default
+
+    async def _process_tool_call_stream(
+        self,
+        index: int,
+        delta: str,
+        parser_dict: Dict[int, FunctionCallParser],
+        content: Dict[str, Any],
+        request: ChatCompletionRequest,
+        has_tool_calls: Dict[int, bool],
+        continuous_usage_stats: bool = False,
+    ):
+        """Process tool calls in streaming response"""
+        if index not in parser_dict:
+            # Use JSON detector directly for required or named tool choice
+            if request.tool_choice == "required" or isinstance(
+                request.tool_choice, ToolChoice
+            ):
+                parser_dict[index] = JsonArrayParser()
+            else:
+                parser_dict[index] = FunctionCallParser(
+                    tools=request.tools,
+                    tool_call_parser=self.tool_call_parser,
+                )
+
+        parser = parser_dict[index]
+
+        # Handle both FunctionCallParser and JsonArrayParser
+        if isinstance(parser, JsonArrayParser):
+            result = parser.parse_streaming_increment(delta, request.tools)
+            normal_text, calls = result.normal_text, result.calls
+        else:
+            normal_text, calls = parser.parse_stream_chunk(delta)
+
+        # Yield normal text
+        if normal_text:
+            choice_data = ChatCompletionResponseStreamChoice(
+                index=index,
+                delta=DeltaMessage(content=normal_text),
+                finish_reason=None,
+            )
+            chunk = ChatCompletionStreamResponse(
+                id=content["meta_info"]["id"],
+                created=int(time.time()),
+                choices=[choice_data],
+                model=request.model,
+            )
+
+            # Add usage stats if continuous_usage_stats is enabled
+            if continuous_usage_stats:
+                prompt_tokens = content["meta_info"].get("prompt_tokens", 0)
+                completion_tokens = content["meta_info"].get("completion_tokens", 0)
+                reasoning_tokens = content["meta_info"].get("reasoning_tokens", 0)
+                chunk.usage = UsageProcessor.calculate_token_usage(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    reasoning_tokens=reasoning_tokens,
+                )
+
+            yield f"data: {chunk.model_dump_json()}\n\n"
+
+        # Yield tool calls
+        history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
+        for call_item in calls:
+            # Mark that this choice has tool calls
+            has_tool_calls[index] = True
+
+            # Tool call ID should be generated only once per tool call
+            if call_item.name:
+                # First chunk: include ID and function name
+                tool_call_id = self._process_tool_call_id(
+                    call_item, history_tool_calls_cnt
+                )
+                function_name = call_item.name
+            else:
+                # Subsequent chunks: null ID and name for argument deltas
+                tool_call_id = None
+                function_name = None
+
+            tool_call = ToolCall(
+                id=tool_call_id,
+                index=call_item.tool_index,
+                function=FunctionResponse(
+                    name=function_name,
+                    arguments=call_item.parameters,
+                ),
+            )
+
+            choice_data = ChatCompletionResponseStreamChoice(
+                index=index,
+                delta=DeltaMessage(tool_calls=[tool_call]),
+                finish_reason=None,
+            )
+            chunk = ChatCompletionStreamResponse(
+                id=content["meta_info"]["id"],
+                created=int(time.time()),
+                choices=[choice_data],
+                model=request.model,
+            )
+
+            # Add usage stats if continuous_usage_stats is enabled
+            if continuous_usage_stats:
+                prompt_tokens = content["meta_info"].get("prompt_tokens", 0)
+                completion_tokens = content["meta_info"].get("completion_tokens", 0)
+                reasoning_tokens = content["meta_info"].get("reasoning_tokens", 0)
+                chunk.usage = UsageProcessor.calculate_token_usage(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    reasoning_tokens=reasoning_tokens,
+                )
+
+            yield f"data: {chunk.model_dump_json()}\n\n"
+
+    def _check_for_unstreamed_tool_args(
+        self,
+        parser: Union[FunctionCallParser, JsonArrayParser],
+        content: Dict[str, Any],
+        request: ChatCompletionRequest,
+        index: int,
+    ) -> Optional[str]:
+        """
+        Check for any remaining tool call arguments that need to be streamed
+        when generation finishes. This ensures tool calls are properly completed
+        even if the model generates the final arguments in the last chunk.
+        """
+        # Get the detector - either from FunctionCallParser or directly if json detector
+        detector = parser.detector if hasattr(parser, "detector") else parser
+
+        # Only check if we have tool calls and the detector has tracked data
+        if (
+            not hasattr(detector, "prev_tool_call_arr")
+            or not detector.prev_tool_call_arr
+        ):
+            return None
+
+        if (
+            not hasattr(detector, "streamed_args_for_tool")
+            or not detector.streamed_args_for_tool
+        ):
+            return None
+
+        # Get the last tool call that was being processed
+        tool_index = len(detector.prev_tool_call_arr) - 1
+        if tool_index < 0 or tool_index >= len(detector.streamed_args_for_tool):
+            return None
+
+        # Get expected vs actual arguments
+        expected_args = detector.prev_tool_call_arr[tool_index].get("arguments", {})
+        expected_call = json.dumps(expected_args, ensure_ascii=False)
+        actual_call = detector.streamed_args_for_tool[tool_index]
+
+        # Check if there are remaining arguments to send
+        remaining_call = (
+            expected_call.replace(actual_call, "", 1)
+            if actual_call in expected_call
+            else ""
+        )
+
+        if remaining_call:
+            # Create tool call chunk with remaining arguments
+            tool_call = ToolCall(
+                id=None,  # No ID for argument deltas
+                index=tool_index,
+                function=FunctionResponse(
+                    name=None,  # No name for argument deltas
+                    arguments=remaining_call,
+                ),
+            )
+
+            choice_data = ChatCompletionResponseStreamChoice(
+                index=index,
+                delta=DeltaMessage(tool_calls=[tool_call]),
+                finish_reason=None,  # Don't send finish_reason with this chunk
+            )
+
+            chunk = ChatCompletionStreamResponse(
+                id=content["meta_info"]["id"],
+                created=int(time.time()),
+                choices=[choice_data],
+                model=request.model,
+            )
+
+            return f"data: {chunk.model_dump_json()}\n\n"
+
+        return None

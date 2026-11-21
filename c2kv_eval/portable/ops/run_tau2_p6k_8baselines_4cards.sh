@@ -7,7 +7,7 @@ set -euo pipefail
 # semantics to c2kv_eval.portable.run and tau2.
 
 BFCL_ROOT="${BFCL_ROOT:-/home/zhuyuhan/project/bfcl-c2kv}"
-SGLANG_ROOT="${SGLANG_ROOT:-/home/zhuyuhan/project/kvoffload-sglang-c2kv}"
+SGLANG_ROOT="${SGLANG_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)/third_party/sglang}"
 C2KV_ROOT="${C2KV_ROOT:-/home/zhuyuhan/project/c2kv}"
 TAU2_ROOT="${TAU2_ROOT:-/home/zhuyuhan/project/benchmarks/tau2-bench}"
 

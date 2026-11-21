@@ -89,6 +89,7 @@ _OPENER = urlrequest.build_opener(urlrequest.ProxyHandler({}))
 from . import repair_policy, textarms
 from .arms import Arm, get_arm, history_kv_spec, kv_reuse_spec
 from .backends import BackendError, get_backend
+from .gp_sjcs import GPSJCSScheduler, is_dynamic_arm
 from .racer import FrozenT02Racer, RacerError, semantic_units
 from .request_recovery import (
     apply_history_recovery_to_arm, apply_recovery_plan_to_arm,
@@ -102,6 +103,7 @@ from .agent.d_witness_core import select_k_star, witness_scores
 WITNESS_TOKENIZER = None
 WITNESS_TOKENIZER_PATH = ""
 RACER_CONTROLLER: Optional[FrozenT02Racer] = None
+GP_SCHEDULER: Optional[GPSJCSScheduler] = None
 
 
 def _portable_tokenizer():
@@ -1565,40 +1567,45 @@ class ProxyHandler(BaseHTTPRequestHandler):
         turn = len(messages)
         text_stats: Optional[Dict[str, Any]] = None
         original_payload = payload
+        active_arm = ARM
         try:
-            if getattr(ARM, "text_policy", None):
-                payload, text_stats = _apply_text_arm(payload, ARM, conv)
+            if GP_SCHEDULER is not None:
+                gp_decision = GP_SCHEDULER.route(payload, _portable_tokenizer())
+                active_arm = replace(ARM, history_kv=gp_decision.pop("history_kv"))
+            else:
+                gp_decision = None
+            if getattr(active_arm, "text_policy", None):
+                payload, text_stats = _apply_text_arm(payload, active_arm, conv)
                 messages = payload["messages"]
-            messages_out, counts = _assemble(messages, ARM)
+            messages_out, counts = _assemble(messages, active_arm)
+            if gp_decision is not None:
+                counts["gp_sjcs"] = gp_decision
             if text_stats is not None:
                 counts["textarm"] = text_stats
-            repair_plan = plan_repair(messages, ARM, counts,
+            repair_plan = plan_repair(messages, active_arm, counts,
                                      tools=payload.get("tools"),
                                      out_messages=messages_out)
             if oracle:
                 repair_plan = plan_gold_repair(
-                    messages, ARM, counts, oracle, payload.get("tools"), messages_out)
-            history_ctx = _history_kv_context(messages_out, counts, ARM)
+                    messages, active_arm, counts, oracle, payload.get("tools"), messages_out)
+            history_ctx = _history_kv_context(messages_out, counts, active_arm)
             if history_ctx is not None:
-                # Joint Tool compression starts on the first request, before
-                # completed history exists.  BFCL supplies a stable task id;
-                # use it instead of the early conversation fingerprint (which
-                # intentionally changes once a second non-system message is
-                # present).  Legacy history-only arms retain the old delayed
-                # open behaviour when no stable benchmark id is available.
+                # Open persistent sessions on the first request whenever the
+                # harness supplies a stable case id. Waiting for completed
+                # history leaves the previous case's held session occupying a
+                # max-running-requests=1 server until its 600-second timeout.
+                # Without a stable id, retain the legacy delayed-open behavior.
                 stable_case = self.eval_context.get("task_id")
-                needs_first_turn_session = bool(
-                    history_ctx["spec"].get("compress_tools"))
                 if (history_ctx["spec"]["persistent_session"]
                         and (history_ctx.get("history_text")
-                             or (needs_first_turn_session and stable_case))):
+                             or stable_case)):
                     session_key = _digest(["bfcl-case", stable_case]) if stable_case else conv
                     history_ctx["session_id"] = _history_session_id(session_key)
                 counts["history_kv"] = {
                     k: history_ctx[k] for k in
                     ("method", "backend", "n_history_messages",
                      "n_history_docs", "history_message_count")}
-            reuse_ctx = _kv_reuse_context(messages_out, counts, ARM)
+            reuse_ctx = _kv_reuse_context(messages_out, counts, active_arm)
             if reuse_ctx is not None:
                 counts["kv_reuse"] = {
                     k: reuse_ctx[k] for k in
@@ -1615,7 +1622,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return
         assemble_sec = time.perf_counter() - start
 
-        def send_upstream(out_messages, plan, request_arm=ARM):
+        def send_upstream(out_messages, plan, request_arm=active_arm):
             # prepare_chat must SEE the assembled messages: the sglang
             # backend attaches repair hashes to the (gist-marked) target
             # message — feeding it the raw payload made every rp-arm
@@ -1635,7 +1642,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 staged["c2kv_use_gist_projection"] = QUERY_PROJECTION == "gist"
             request_history_ctx = history_ctx
             if (getattr(request_arm, "history_kv", None)
-                    and request_arm is not ARM):
+                    and request_arm is not active_arm):
                 request_history_ctx = _history_kv_context(
                     out_messages, counts, request_arm)
             if getattr(BACKEND, "wants_request_context", False):
@@ -1647,7 +1654,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                              "kv_reuse": reuse_ctx})
             else:
                 out_payload = BACKEND.prepare_chat(staged, request_arm, plan)
-            if getattr(request_arm, "racer", False) and request_arm is ARM:
+            if getattr(request_arm, "racer", False) and request_arm is active_arm:
                 # Draft is not committed to BFCL; SGLang still advances its canonical
                 # pre-decode prompt ledger because the persistent KV is already resident.
                 out_payload["return_hidden_states"] = True
@@ -1669,6 +1676,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # second non-idempotent decode while the first may still run.
             rid = str(out_payload.get("rid") or uuid.uuid4().hex)
             out_payload["rid"] = rid
+            counts["outgoing_messages_sha256"] = _digest(out_payload.get("messages") or [])
+            counts["outgoing_tools_sha256"] = _digest(out_payload.get("tools") or [])
+            counts["outgoing_prompt_contract_sha256"] = _digest({
+                "messages": out_payload.get("messages") or [],
+                "tools": out_payload.get("tools") or [],
+                "chat_template_kwargs": out_payload.get("chat_template_kwargs") or {},
+            })
             try:
                 return _post_json(
                     self.path, out_payload, UPSTREAM_TIMEOUT, retries=0), out_payload
@@ -1681,7 +1695,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         pass
                 raise
 
-        def call_upstream(out_messages, plan, request_arm=ARM):
+        def call_upstream(out_messages, plan, request_arm=active_arm):
             data_, _ = send_upstream(out_messages, plan, request_arm)
             try:
                 return data_, BACKEND.normalize_response(data_)
@@ -1693,14 +1707,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
         try:
             try:
                 data, normalized = call_upstream(messages_out, repair_plan)
-                if ARM.text_policy == "hiagent_full":
+                if active_arm.text_policy == "hiagent_full":
                     def send_retrieved(staged):
                         nonlocal payload, messages_out
                         payload = staged
-                        messages_out, _ = _assemble(staged["messages"], ARM)
+                        messages_out, _ = _assemble(staged["messages"], active_arm)
                         return send_upstream(messages_out, None)[0]
                     data = _hiagent_retrieval_loop(
-                        original_payload, ARM, conv, data, text_stats, send_retrieved)
+                        original_payload, active_arm, conv, data, text_stats, send_retrieved)
                     normalized = BACKEND.normalize_response(data)
             except CacheMiss:
                 # Pool-evicted gists and/or an evicted repair span.  Three
@@ -1721,19 +1735,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 #      survived the retry unchanged.
                 for record in counts.get("compressed_records") or []:
                     fresh = _extract(record["role"], record["content"],
-                                     ARM.ratio, force=True)
+                                     active_arm.ratio, force=True)
                     record["record"] = fresh
                     idx = record.get("out_index")
                     if (isinstance(idx, int) and 0 <= idx < len(messages_out)
                             and messages_out[idx].get("c2kv_key_hash")
                             and fresh.get("key_hash")):
                         messages_out[idx]["c2kv_key_hash"] = fresh["key_hash"]
-                repair_plan = plan_repair(messages, ARM, counts,
+                repair_plan = plan_repair(messages, active_arm, counts,
                                           tools=payload.get("tools"),
                                           out_messages=messages_out)
                 if oracle:
                     repair_plan = plan_gold_repair(
-                        messages, ARM, counts, oracle, payload.get("tools"), messages_out, force=True)
+                        messages, active_arm, counts, oracle, payload.get("tools"), messages_out, force=True)
                 data, normalized = call_upstream(messages_out, repair_plan)
         except (UpstreamError, BackendError, CacheMiss, RuntimeError, ValueError,
                 URLError, OSError) as error:
@@ -1889,7 +1903,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             {
                 "backend": BACKEND.name,
                 "arm": ARM.name,
-                "ratio": ARM.ratio,
+                "selected_runtime_arm": active_arm.name,
+                "ratio": active_arm.ratio,
                 "gist_tokens": counts["gist_tokens"],
                 "original_tokens": counts["original_tokens"],
                 "history_packed_original_tokens": counts["history_packed_original_tokens"],
@@ -2033,8 +2048,23 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     if k in ("system_raw", "history_raw", "current_raw", "compressed")})
         row.update({k: counts.get(k) for k in
                     ("doc_packing", "n_docs", "dropped_docs", "repair_frame",
-                     "history_kv", "kv_reuse", "gold_recovery", "request_recovery", "racer", "history_tensor_accounting")
+                     "outgoing_messages_sha256", "outgoing_tools_sha256",
+                     "outgoing_prompt_contract_sha256",
+                     "history_kv", "kv_reuse", "gold_recovery", "request_recovery", "racer",
+                     "history_tensor_accounting", "gp_sjcs")
                     if k in counts})
+        if isinstance(counts.get("gp_sjcs"), dict):
+            decision = counts["gp_sjcs"]
+            row.update({
+                "gp_selected_config": decision.get("selected_config"),
+                "gp_feature_extraction_ms": decision.get("feature_extraction_ms"),
+                "gp_prediction_ms": decision.get("gp_prediction_ms"),
+                "gp_controller_preparation_ms": decision.get("controller_preparation_ms"),
+                "gp_requested_history_budget": decision.get("requested_history_budget"),
+                "gp_requested_history_target_tokens": decision.get("requested_history_target_tokens"),
+                "gp_tool_target_ratio": decision.get("tool_target_ratio"),
+                "gp_history_target_ratio": decision.get("history_target_ratio"),
+            })
         if counts.get("textarm") is not None:
             row["textarm"] = counts["textarm"]
         if isinstance(counts.get("racer"), dict):
@@ -2110,12 +2140,25 @@ def main(argv=None):
     MAX_COMPLETION_TOKENS = int(args.max_completion_tokens)
     STATE.max_history_sessions = int(args.max_history_sessions)
     ARM = get_arm(args.arm)
-    global RACER_CONTROLLER
+    global RACER_CONTROLLER, GP_SCHEDULER
     RACER_CONTROLLER = FrozenT02Racer() if ARM.racer else None
     UPSTREAM = args.upstream.rstrip("/")
     REQUEST_LOG_PATH = args.request_log
     BACKEND = get_backend(args.backend, _post_json)
     WITNESS_TOKENIZER_PATH = args.witness_tokenizer
+    if is_dynamic_arm(ARM.name):
+        artifact = os.environ.get("GP_SJCS_ARTIFACT", "").strip()
+        if not artifact:
+            raise SystemExit("FATAL: dynamic GP-SJCS arm needs GP_SJCS_ARTIFACT")
+        GP_SCHEDULER = GPSJCSScheduler.from_path(
+            artifact,
+            mode=ARM.name,
+            history_budget=int(os.environ.get("GP_SJCS_HISTORY_BUDGET", "256")),
+            beta=float(os.environ.get("GP_SJCS_BETA", "0.25")),
+        )
+        print(f"loaded GP-SJCS artifact={artifact} mode={ARM.name}", flush=True)
+    else:
+        GP_SCHEDULER = None
     STATE.reference_log_path = args.record_reference
     if args.reference:
         if not ARM.recover:

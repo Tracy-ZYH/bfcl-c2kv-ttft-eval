@@ -1,0 +1,10 @@
+{
+  "schema": "a-event-native-eval-policy-v1",
+  "policy_id": "bfcl-long-ratio8-s0-v2",
+  "policy": {
+    "history_budget_bytes": 2147483648,
+    "workspace_budget_bytes": 2147483648,
+    "lease_decisions": 0,
+    "max_retrieved_events": 2
+  }
+}

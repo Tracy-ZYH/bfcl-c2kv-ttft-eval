@@ -1,0 +1,64 @@
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/docs/bfcl_long_frozen_baselines.md:86:`results/bfcl_long_bcrs_v2_stage_b_runlevel_fix_gpu0_20261111_003838/summary/bcrs_smoke.json`
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/docs/BFCL_LONG_FROZEN_BASELINES.md:84:`results/bfcl_long_bcrs_v2_stage_b_runlevel_fix_gpu0_20261111_003838/summary/bcrs_smoke.json`
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/tests/test_bfcl_long_length_bucket_ttft.py:138:                    root / "gpu0/rep0/full_cold/run/task_shards"
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/tests/test_bfcl_long_length_bucket_ttft.py:168:            steps = root / "gpu0/rep0/full_cold/run/task_shards/multi/server/steps.jsonl"
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/tests/test_bfcl_long_ttft.py:139:                                     'eval_policy_bfcl_long_fixed256.json')
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/tests/portable/test_gp_sjcs.py:24:def test_a0_is_uncompressed_and_history_budget_is_capped():
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/tests/portable/test_gp_sjcs.py:46:    scheduler = GPSJCSScheduler(artifact, "gp_profile_a3", history_budget=256)
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/bcro.py:181:            "history_budget_tokens": 256 if decision["compress"] else None,
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/proxy.py:2063:                "gp_requested_history_budget": decision.get("requested_history_budget"),
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/proxy.py:2156:            history_budget=int(os.environ.get("GP_SJCS_HISTORY_BUDGET", "256")),
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/bcrs.py:206:            "history_budget_tokens": 256 if compress else None,
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/ops/run_bfcl_long_decision_dual_gp_gpu6.sh:22:SOURCE_FULL="${SOURCE_FULL:-/home/zhuyuhan/project/bfcl-c2kv/results/bfcl_long_soft256_full200_gpu012_20261029_153723}"
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/ops/run_bfcl_long_decision_dual_gp_gpu6.sh:24:POLICY="${C1_ROOT}/experiments/history_system/runtime/configs/eval_policy_bfcl_long_fixed256.json"
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/ops/ttft_commands.py:17:EVAL_POLICY = C2KV / 'experiments/history_system/runtime/configs/eval_policy_bfcl_long_fixed256.json'
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/ops/fit_bcrs.py:224:        "selected_backend": "existing_c2kv_racer_8x_fixed256",
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/ops/toolsandbox_cache_hit_ttft.py.orig:36:POLICY = C2KV / 'experiments/history_system/runtime/configs/eval_policy_bfcl_long_fixed256.json'
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/ops/run_bfcl_long_bcro_stage_b_gpu0.sh:22:POLICY="${C1_ROOT}/experiments/history_system/runtime/configs/eval_policy_bfcl_long_fixed256.json"
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/ops/run_bfcl_long_bcro_stage_b_gpu0.sh:28:RESULT_ROOT="${RESULT_ROOT:-${ROOT}/results/bcro_stage_b_full117_gpu${GPU}_$(date +%Y%m%d_%H%M%S)}"
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/ops/run_bfcl_long_bcro_stage_b_gpu0.sh:185:    "${ROOT}/c2kv_eval/portable/ops/summarize_bcro_stage_b.py" \
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/ops/toolsandbox_cache_hit_ttft.py:38:POLICY = C2KV / 'experiments/history_system/runtime/configs/eval_policy_bfcl_long_fixed256.json'
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/ops/summarize_bcrs_smoke.py:85:            budget = controller.get("requested_history_budget_tokens")
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/ops/summarize_bcrs_smoke.py:127:        "requested_history_budget_values": sorted(set(budgets)),
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/ops/run_bfcl_long_bcro_precommit_guard_smoke_gpu7.sh:7:BASE="${ROOT}/c2kv_eval/portable/ops/run_bfcl_long_bcro_stage_b_gpu0.sh"
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/ops/bfcl_long_length_bucket_ttft.py.orig:26:    "bfcl_long_soft256_full200_gpu012_20261029_153723"
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/ops/bfcl_long_length_bucket_ttft.py:28:    "bfcl_long_soft256_full200_gpu012_20261029_153723"
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/ops/summarize_bcro_stage_b.py:289:    (out / "bcro_stage_b_test117.json").write_text(
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/ops/summarize_bcro_stage_b.py:291:    with (out / "bcro_stage_b_test117.csv").open("w", newline="", encoding="utf-8") as handle:
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/ops/evaluate_bcro_stage_a.py:296:        "selected_backend": "existing_c2kv_racer_8x_fixed256",
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/ops/decision_dual_gp_experiment.py:27:    "bfcl_long_soft256_full200_gpu012_20261029_153723"
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/ops/decision_dual_gp_experiment.py:425:        "history_budget_tokens": 256,
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/ops/fit_gp_sjcs.py:109:                observed, a0, args.history_budget, length_only=length_only))
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/ops/fit_gp_sjcs.py:122:            observed_a1, a1, args.history_budget, length_only=False)
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/ops/fit_gp_sjcs.py:124:            observed_a1, a1, args.history_budget, length_only=True)
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/ops/fit_gp_sjcs.py:131:                observed_a1, a1, args.history_budget)
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/ops/fit_gp_sjcs.py:153:        "history_budget": args.history_budget,
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/gp_sjcs.py:24:    "tool_retention", "history_retention", "history_budget_fraction",
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/gp_sjcs.py:174:                   history_budget: int, length_only: bool = False) -> np.ndarray:
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/gp_sjcs.py:176:    target = candidate.history_target(int(hist), history_budget)
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/gp_sjcs.py:199:                       history_budget: int) -> float:
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/gp_sjcs.py:204:    target = candidate.history_target(int(hist), history_budget)
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/gp_sjcs.py:243:                 history_budget: int = 256, beta: float = 0.25):
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/gp_sjcs.py:248:        self.history_budget = int(history_budget)
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/gp_sjcs.py:255:                  history_budget: int = 256, beta: float = 0.25) -> "GPSJCSScheduler":
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/gp_sjcs.py:257:        return cls(payload, mode, history_budget, beta)
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/gp_sjcs.py:265:        target = candidate.history_target(int(features["L_hist"]), self.history_budget)
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/gp_sjcs.py:307:                        observed, candidate, self.history_budget, length_only)
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/gp_sjcs.py:310:                        observed, candidate, self.history_budget) + residual
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/gp_sjcs.py:337:        target = chosen.history_target(int(observed["L_hist"]), self.history_budget)
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/gp_sjcs.py:348:            "requested_history_budget": self.history_budget,
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/gp_sjcs.py:356:            "history_budget_semantics": "hard_server_token_target_with_alignment_telemetry",
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/gp_sjcs.py:361:                int(observed["L_hist"]), self.history_budget),
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/ops/run_bcro_full_parity.sh:37:POLICY="${C1_ROOT}/experiments/history_system/runtime/configs/eval_policy_bfcl_long_fixed256.json"
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/bcro.py.orig:176:            "history_budget_tokens": 256 if decision["compress"] else None,
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/ops/evaluate_bcro_stage_a2.py:334:        "selected_backend": "existing_c2kv_racer_8x_fixed256",
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/ops/run_bfcl_long_bcrs_gpu0.sh:19:POLICY="${C1_ROOT}/experiments/history_system/runtime/configs/eval_policy_bfcl_long_fixed256.json"
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/decision_dual_gp.py:131:            "history_budget_tokens": 256 if compress else None,
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/ops/run_bfcl_long_bcro_stage_b_gpu0.sh.orig:22:POLICY="${C1_ROOT}/experiments/history_system/runtime/configs/eval_policy_bfcl_long_fixed256.json"
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/ops/run_bfcl_long_bcro_stage_b_gpu0.sh.orig:28:RESULT_ROOT="${RESULT_ROOT:-${ROOT}/results/bcro_stage_b_full117_gpu${GPU}_$(date +%Y%m%d_%H%M%S)}"
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/ops/run_bfcl_long_bcro_stage_b_gpu0.sh.orig:169:    "${ROOT}/c2kv_eval/portable/ops/summarize_bcro_stage_b.py" \
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/arms.py:112:        spec["requested_history_budget"] = budget
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/arms.py:221:        spec["requested_history_budget"] = budget
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/backends/sglang.py:390:                    "requested_history_budget": spec.get("target_tokens"),
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/backends/sglang.py:448:                "requested_history_budget": spec.get("target_tokens"),
+/home/zhuyuhan/project/bfcl-c2kv-ttft-eval/c2kv_eval/portable/backends/sglang.py:796:            "requested_history_budget": report.get("requested_history_budget") or report.get("history_kv_target_tokens"),

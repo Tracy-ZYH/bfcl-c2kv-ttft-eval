@@ -29,6 +29,7 @@ def build_context(args: argparse.Namespace) -> RunContext:
         raise ValueError("agent C1 endpoint and raw Full user endpoint must differ")
     options = {
         "bench_python": args.bench_python,
+        "checkpoint": args.user_model,
         "num_workers": 1,
     }
     if args.benchmark == "tau2":
@@ -98,6 +99,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--model", default="c1_legacy_prefill")
+    parser.add_argument("--user-model", required=True)
     parser.add_argument("--task-set", default="airline")
     parser.add_argument("--tau2-max-steps", type=int)
     parser.add_argument("--task-timeout", type=int, default=3600)

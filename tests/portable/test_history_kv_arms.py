@@ -452,6 +452,25 @@ class TestPhysicalEvictionPath:
             "enabled": True, "session_id": "sess-1"}
         assert hint["history_kv_eviction"]["persistent_session"] is True
 
+    def test_persistent_first_turn_initializes_session_without_eviction(self):
+        out, _, ctx = _context(
+            [{"role": "system", "content": "s"},
+             {"role": "user", "content": "first question"}],
+            self.SESSION_ARM,
+        )
+        ctx["session_id"] = "sess-first-turn"
+        prepared = SglangBackend(FakePost({})).prepare_chat(
+            {"messages": out}, self.SESSION_ARM, None,
+            context={"history_kv": ctx},
+        )
+        assert prepared["messages"] == out
+        assert prepared["session_params"] == {"id": "sess-first-turn"}
+        hint = prepared["c2kv_kv_memory_hint"]
+        assert hint["persistent_history_session"] == {
+            "enabled": True, "session_id": "sess-first-turn"}
+        assert hint["history_kv_backend"] == "physical_eviction"
+        assert "history_kv_eviction" not in hint
+
     def test_ratio_budget_is_deferred_to_server_tokenization(self):
         arm = get_arm("history_kv_h2o_r25_persistent")
         out, counts, ctx = _context(_messages(), arm)

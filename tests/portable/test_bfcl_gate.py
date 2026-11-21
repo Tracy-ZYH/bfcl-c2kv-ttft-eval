@@ -15,6 +15,15 @@ from c2kv_eval.portable import terminal_check, textarms
 from c2kv_eval.portable.adapters import bfcl_adapter
 
 
+def test_bfcl_execute_result_normalizes_object_arguments_only():
+    normalize = bfcl_adapter._normalize_bfcl_execute_result
+    assert normalize([{"ls": '{"a": true}'}]) == [{"ls": {"a": True}}]
+    assert normalize([{"ls": {"a": True}}]) == [{"ls": {"a": True}}]
+    assert normalize([{"cd": '"workspace"'}]) == []
+    assert normalize([{"cd": "not-json"}]) == []
+    assert normalize("visible final answer") == []
+
+
 def test_embedded_cli_returns_to_run_evaluation(monkeypatch):
     typer = pytest.importorskip("typer")
     cli = typer.Typer()
@@ -111,6 +120,7 @@ def test_hiagent_native_response_matches_bfcl_fc_handler_contract(monkeypatch):
     assert parsed["model_responses"] == [{"ls": '{"a": true}'}]
     assert parsed["tool_call_ids"] == ["call-1"]
     assert parsed["model_responses_message_for_chat_history"] is message
+    assert handler.decode_execute("visible final answer", False) == []
     assert "Action:" not in textarms.HIAGENT_SUBGOAL_NOTE
 
 

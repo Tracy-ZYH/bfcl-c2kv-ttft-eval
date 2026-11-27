@@ -1,0 +1,17 @@
+{
+  "frozen_experiment": "BCRO-120",
+  "frozen_runtime_commit": "a271a2d59b69835aca5301c31280098efa4460a0",
+  "artifact_migration_base_commit": "3df3587ec68251884aa1c2a58f7094cc2c2af905",
+  "files": {
+    "bcro_artifact.seed0.json": "results/bcro_stage_a2_20261111_022630/seed_0/bcro_artifact.json",
+    "split.seed0.csv": "results/bcro_stage_a2_20261111_022630/seed_0/split.csv",
+    "bcrs_v2_artifact.json": "results/bcrs_stage_a_v2_final_20261110_210050/bcrs_v2_artifact.json",
+    "eval_policy_bfcl_long_fixed256.json": "runtime/configs/eval_policy_bfcl_long_fixed256.json",
+    "eval_capacity_bfcl_long.json": "runtime/configs/eval_capacity_bfcl_long.json"
+  },
+  "external_assets": {
+    "model": "/home/zhuyuhan/models/b_history/arm-C/seed-42/checkpoint-1000",
+    "embedding_model": "/home/zhuyuhan/lyc/models/Qwen3-Embedding-0.6B"
+  },
+  "compatibility": "Original result files are retained; migrated files are byte-identical."
+}

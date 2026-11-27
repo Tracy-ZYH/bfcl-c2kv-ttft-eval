@@ -12,9 +12,9 @@ from typing import Any
 
 
 HERE = Path(__file__).resolve().parent
-RUNTIME = HERE / "runtime"
+RUNTIME = HERE.parent
 RUNTIME_PYTHON = RUNTIME / "python"
-IDENTITY_MANIFEST = HERE / "artifacts/c1000_identity.json"
+IDENTITY_MANIFEST = RUNTIME / "artifacts/c1000_identity.json"
 REQUIRED_IDENTITY_FILES = frozenset(
     {
         "chat_template.jinja",

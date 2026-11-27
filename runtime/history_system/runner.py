@@ -18,7 +18,7 @@ from urllib.request import Request, urlopen
 
 
 HERE = Path(__file__).resolve().parent
-ROOT = HERE / "runtime"
+ROOT = HERE.parent
 DEVELOPMENT_STATUS = "development_not_frozen"
 FROZEN_STATUS = "frozen"
 SUPPORTED_RATIOS = frozenset({4, 8})
@@ -865,7 +865,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--bfcl-python")
     parser.add_argument("--port-base", type=int, default=36000)
     parser.add_argument("--preview-output", type=Path)
-    parser.add_argument("--runtime-root", type=Path, default=HERE / "runtime")
+    parser.add_argument("--runtime-root", type=Path, default=HERE.parent)
     args = parser.parse_args(argv)
     global ROOT
     ROOT = args.runtime_root.resolve()

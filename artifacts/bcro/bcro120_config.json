@@ -1,0 +1,69 @@
+{
+  "schema": "bcro-120-reproduction-config-v1",
+  "name": "bcro_stage_b_full120_20261120",
+  "task_manifest": "artifacts/bcro/task_ids.120.txt",
+  "task_manifest_sha256": "405baee78cfa26cfe351c1483021e0d216e82b9d4ae8041ccefae706fcc29d74",
+  "task_count": 120,
+  "stage_a2_test_count": 117,
+  "additional_task_ids": [
+    "multi_turn_long_context_46",
+    "multi_turn_long_context_50",
+    "multi_turn_long_context_198"
+  ],
+  "bcro_artifact": "artifacts/bcro/bcro_artifact.seed0.json",
+  "bcro_artifact_sha256": "22f7f08ada9ed7588c85774aa2f4789e9a69e113279e502f22c73f0ca295a84d",
+  "split": "artifacts/bcro/split.seed0.csv",
+  "split_sha256": "87d6f5ae491465e07f5cc09c4ebeed90e7376e317da35ae3964879a19f160c19",
+  "policy": "artifacts/bcro/eval_policy_bfcl_long_fixed256.json",
+  "policy_sha256": "4bd62b79a713c01d791b576a918762c73a42e3a77fa4f9dd4a24848ea4bf0246",
+  "capacity": "artifacts/bcro/eval_capacity_bfcl_long.json",
+  "capacity_sha256": "ae8bba4161bea8ad8f90731381c3a1e6c033461b489d09a11ebd47d000ab4d66",
+  "frozen_runtime_commit": "a271a2d59b69835aca5301c31280098efa4460a0",
+  "model": "/home/zhuyuhan/models/b_history/arm-C/seed-42/checkpoint-1000",
+  "model_config_sha256": "15e14bfa5853ce7e74ef3cd6d65fc4b4411378c3111aebcfdc8ed272f5424655",
+  "embedding_model": "/home/zhuyuhan/lyc/models/Qwen3-Embedding-0.6B",
+  "detector": {
+    "kind": "t02_risk",
+    "artifact": "runtime/artifacts/c1_risk.t02_v1.json",
+    "artifact_sha256": "18a11f73aa1f7d4b0add86eed66ae9e5e129ea4bdfbe0dfad23faf4f7d2fb4ab",
+    "threshold": 0.5
+  },
+  "compression": {
+    "ratio": 8,
+    "history_variant": "H0",
+    "history_budget_tokens": 256,
+    "selection_protocol": "evidence_sets_v1"
+  },
+  "guards": {
+    "exact_identifier": true,
+    "readonly_repeat_same_turn": true,
+    "readonly_repeat_previous_turn": false,
+    "readonly_repeat_no_tools_max_tokens": null,
+    "post_tweet_literal": true,
+    "cancel_booking_full_diversion": true,
+    "query_unique_raw_evidence": false,
+    "shared_regeneration_budget": 1
+  },
+  "generation": {
+    "dtype": "bfloat16",
+    "random_seed": 0,
+    "max_running_requests": 1,
+    "disable_radix_cache": true,
+    "disable_cuda_graph": true,
+    "page_size": 1,
+    "context_length": 262144,
+    "max_total_tokens": 262144,
+    "chunked_prefill_size": 4096
+  },
+  "historical_result": {
+    "path": "results/bcro_stage_b_full120_gpu0_20261120_212042",
+    "status": "completed",
+    "official_correct_count": 33,
+    "official_total_count": 120,
+    "decision_count": 1288,
+    "racer_selected_count": 448,
+    "detector_calls": 440,
+    "detector_trigger_count": 117,
+    "recovery_count": 117
+  }
+}

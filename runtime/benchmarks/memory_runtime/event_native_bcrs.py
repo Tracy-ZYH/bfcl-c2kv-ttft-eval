@@ -107,12 +107,16 @@ class _OrdinaryFullRunner:
                 self.max_new_tokens
                 if max_new_tokens is None else int(max_new_tokens)
             )
+            prepare_started = time.perf_counter()
+            prepared_payload = _portable_full_payload(
+                payload, disable_tools=disable_tools,
+                max_new_tokens=effective_max_new_tokens,
+            )
+            record["controller_timing"]["prepare_seconds"] = (
+                time.perf_counter() - prepare_started
+            )
             data = self.generator.generate_ordinary_full(
-                _portable_full_payload(
-                    payload, disable_tools=disable_tools,
-                    max_new_tokens=effective_max_new_tokens,
-                ),
-                model_name=self.model_name,
+                prepared_payload, model_name=self.model_name,
                 max_new_tokens=effective_max_new_tokens,
             )
             choices = data.get("choices")

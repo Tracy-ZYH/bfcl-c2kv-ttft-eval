@@ -1,0 +1,11 @@
+{
+  "schema": "a-event-native-eval-policy-v1",
+  "policy_id": "bfcl-long-ratio8-s0-fixed256-kv-v1",
+  "policy": {
+    "history_budget_bytes": 37748736,
+    "workspace_budget_bytes": 37748736,
+    "lease_decisions": 0,
+    "max_retrieved_events": 2,
+    "whole_event_soft_budget": true
+  }
+}

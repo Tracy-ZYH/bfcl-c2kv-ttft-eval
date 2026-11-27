@@ -30,9 +30,10 @@ import runner
 from c1_artifact_binding import bind_risk_artifact
 
 HERE = Path(__file__).resolve().parent
-RUNTIME = HERE / "runtime"
+MONOREPO_ROOT = HERE.parents[1]
+RUNTIME = HERE.parent
 FULL_EVAL_CAPACITY = RUNTIME / "configs/eval_capacity_full_context.json"
-DEFAULT_RISK_ARTIFACT = HERE / "artifacts/c1_risk.t02_v1.json"
+DEFAULT_RISK_ARTIFACT = RUNTIME / "artifacts/c1_risk.t02_v1.json"
 DEFAULT_RISK_ARTIFACT_SHA256 = "18a11f73aa1f7d4b0add86eed66ae9e5e129ea4bdfbe0dfad23faf4f7d2fb4ab"
 BENCHMARKS = ("bfcl", "tau2", "toolsandbox")
 METHODS = ("proposed", "c2kv_only", "full")
@@ -725,7 +726,12 @@ def functional_checks(method: str, detector: str, telemetry: Mapping[str, Any]) 
     return {
         "required": {
             "native_generate_requests": (
-                telemetry["native_generate_requests"] > 0
+                (
+                    method == "full"
+                    and telemetry.get("ordinary_full_requests", 0) > 0
+                    and telemetry.get("native_generate_requests", 0) == 0
+                )
+                or telemetry["native_generate_requests"] > 0
                 or (
                     telemetry.get("bcrs_decision_count", 0) > 0
                     and telemetry.get("bcrs_racer_selected_count", 0) == 0
@@ -1004,10 +1010,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ts-agent", default="GPT_4_o_2024_05_13")
     parser.add_argument("--ts-user", default="GPT_4_o_2024_05_13")
     parser.add_argument("--user-base-url")
-    parser.add_argument("--portable-root", type=Path, default=Path("/home/zhuyuhan/project/bfcl-c2kv"))
+    parser.add_argument("--portable-root", type=Path, default=MONOREPO_ROOT)
     parser.add_argument(
         "--sglang-root", type=Path,
-        default=Path("/home/zhuyuhan/project/kvoffload-sglang-c2kv-pr5-runtime"),
+        default=MONOREPO_ROOT / "third_party/sglang",
         help="SGLang checkout served by --sglang-backend-url; recorded for provenance",
     )
     parser.add_argument("--out", type=Path, required=True)
@@ -1066,8 +1072,14 @@ def validate_args(args: argparse.Namespace) -> list[str]:
         raise ValueError("embedding model must be a local model directory")
     if not (args.checkpoint / "config.json").is_file():
         raise ValueError("checkpoint must be a local model directory")
-    if not (args.sglang_root / ".git").exists():
-        raise ValueError("--sglang-root must be the PR #5-compatible SGLang checkout")
+    if not (args.sglang_root / ".git").exists() and not (
+        (args.sglang_root / "__init__.py").is_file()
+        and (args.sglang_root / "launch_server.py").is_file()
+        and (args.sglang_root / "srt").is_dir()
+    ):
+        raise ValueError(
+            "--sglang-root must be a compatible checkout or vendored SGLang package"
+        )
     _bare_endpoint(args.sglang_backend_url)
     if args.benchmark != "bfcl":
         if not args.user_base_url:

@@ -11,11 +11,11 @@ import sys
 import types
 
 HERE = Path(__file__).resolve().parent
-RUNTIME = HERE / "runtime"
+RUNTIME = HERE.parent
 
 
 def load_config():
-    return json.loads((HERE / "configs/current_algorithm.json").read_text(encoding="utf-8"))
+    return json.loads((RUNTIME / "configs/current_algorithm.json").read_text(encoding="utf-8"))
 
 
 def _configure_controller(base, switches):
